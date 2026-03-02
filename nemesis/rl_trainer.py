@@ -2,26 +2,37 @@
 RL Trainer — trains the Translator model using reinforcement learning
 with OpenAI API as the reward function.
 
+Key insight: we have NO ground truth for the neuro-symbolic output.
+The symbolic representation is a FREE latent space that the Translator
+learns to use in whatever way maximizes downstream activity recognition.
+
 Training loop:
   1. Translator generates neuro-symbolic output from IMU tokens
-  2. Output is sent to OpenAI to interpret the activity
-  3. OpenAI rates the quality / clarity of the symbolic output (reward)
-  4. Policy gradient (REINFORCE or PPO) updates Translator weights
+  2. Output is sent to OpenAI which CLASSIFIES it into one of the known activities
+  3. Classification result compared to ground truth → binary reward
+  4. Policy gradient (PPO) updates Translator to produce symbolic outputs
+     that lead OpenAI to the correct activity classification
 
-Supports both:
-  - REINFORCE with baseline (simple, less stable)
-  - PPO (clipped objective, recommended)
+v2 improvements:
+  - Classification-style reward: 1 API call instead of 2 (less noise, faster)
+  - Running reward normalization for stable gradients
+  - LR warmup + cosine decay
+  - Entropy coefficient annealing (high→low for exploration→exploitation)
+  - Partial credit for related activities
 """
 
 import os
 import json
 import time
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
+from collections import deque
 
 from openai import OpenAI
 
@@ -31,22 +42,68 @@ from nemesis.neuro_symbolic import SymbolicVocab
 
 
 # ============================================================================
-# Reward Function via OpenAI
+# Activity Similarity Map (for partial credit)
+# ============================================================================
+
+# Groups of related activities — members get partial credit against each other
+ACTIVITY_GROUPS = {
+    "locomotion": {"walking", "walking_upstairs", "walking_downstairs",
+                   "walking forward on a flat surface at a normal steady pace",
+                   "walking up a flight of stairs at a steady pace",
+                   "walking down a flight of stairs at a steady pace"},
+    "stationary": {"sitting", "standing", "laying",
+                   "sitting still on a chair in a relaxed position",
+                   "standing upright in place without moving",
+                   "lying down flat on a surface in a resting position"},
+}
+
+
+def _activities_related(a: str, b: str) -> bool:
+    """Check if two activities belong to the same group."""
+    a_lower, b_lower = a.lower().strip(), b.lower().strip()
+    for group in ACTIVITY_GROUPS.values():
+        a_in = any(a_lower in m or m in a_lower for m in group)
+        b_in = any(b_lower in m or m in b_lower for m in group)
+        if a_in and b_in:
+            return True
+    return False
+
+
+# ============================================================================
+# Reward Function via OpenAI (Classification-style)
 # ============================================================================
 
 class OpenAIRewardFunction:
     """
-    Uses OpenAI API to score the quality of neuro-symbolic translations.
+    Classification-style reward computation (v2):
 
-    The reward is based on:
-      1. Clarity: Is the symbolic output interpretable?
-      2. Specificity: Does it describe a recognizable activity?
-      3. Coherence: Are the statements internally consistent?
+    Instead of 2 API calls (interpret + match), we do 1 call:
+      - Present the symbolic text + list of possible activities
+      - OpenAI picks the most likely activity
+      - Binary reward: correct=1.0, related=0.3, wrong=-0.1
+
+    This gives:
+      - 50% fewer API calls (faster + cheaper)
+      - Less reward noise (no semantic similarity scoring variance)
+      - Cleaner gradient signal for PPO
     """
 
-    def __init__(self, config: RLConfig = RLConfig()):
+    def __init__(self, config: RLConfig = RLConfig(), activity_options: List[str] = None):
         self.config = config
         self.client = OpenAI(api_key=load_api_key())
+        self.activity_options = activity_options or []
+        # Sensor context for richer prompts
+        self.sensor_context: Optional[Dict] = None
+        # Cache: symbolic_text_hash → (reward, predicted_activity)
+        self._cache: Dict[str, Tuple[float, str]] = {}
+
+    def set_activity_options(self, options: List[str]):
+        """Set the valid activity options for classification."""
+        self.activity_options = list(set(options))
+
+    def set_sensor_context(self, ctx: Dict):
+        """Set IMU sensor context for richer prompts."""
+        self.sensor_context = ctx
 
     def compute_reward(
         self,
@@ -54,29 +111,155 @@ class OpenAIRewardFunction:
         ground_truth: Optional[str] = None,
     ) -> Tuple[float, str]:
         """
-        Score a neuro-symbolic output.
-
-        Args:
-            symbolic_text: The generated neuro-symbolic description
-            ground_truth: Optional ground truth activity label
+        Score a neuro-symbolic output by classifying it into one of the
+        known activities, then comparing to ground truth.
 
         Returns:
-            reward: float in [0, 1]
-            activity: The interpreted activity description
+            reward: float
+            activity: OpenAI's predicted activity
         """
-        prompt = self._build_reward_prompt(symbolic_text, ground_truth)
+        # Check cache first
+        cache_key = hash(symbolic_text)
+        if cache_key in self._cache and ground_truth is not None:
+            cached_activity = self._cache[cache_key][1]
+            reward = self._compute_classification_reward(cached_activity, ground_truth)
+            return reward, cached_activity
+
+        # Single API call: classify the symbolic text
+        if self.config.classify_reward and self.activity_options:
+            activity = self._classify_symbolic(symbolic_text)
+        else:
+            activity = self._interpret_symbolic(symbolic_text)
+
+        # Cache the prediction
+        self._cache[cache_key] = (0.0, activity)
+
+        # Compute reward
+        if ground_truth is not None:
+            if self.config.classify_reward:
+                reward = self._compute_classification_reward(activity, ground_truth)
+            else:
+                reward = self._compute_match_reward(activity, ground_truth)
+        else:
+            reward = 0.1 if self._is_parseable(symbolic_text) else 0.0
+
+        return reward, activity
+
+    def _classify_symbolic(self, symbolic_text: str) -> str:
+        """
+        Single-step classification with rich sensor context.
+
+        The prompt now includes:
+          - What kind of sensor data this came from (IMU, channels, rate)
+          - Duration of the recording window
+          - The neuro-symbolic representation
+          - The fixed list of possible activities to choose from
+
+        This gives OpenAI maximum context to make a good classification.
+        """
+        # Build sensor context section
+        if self.sensor_context:
+            ctx = self.sensor_context
+            channels_str = ", ".join(ctx.get("channel_names", []))
+            sensor_section = (
+                f"SENSOR SETUP:\n"
+                f"  Device: IMU (Inertial Measurement Unit) worn on the body\n"
+                f"  Channels: {ctx['num_channels']} ({channels_str})\n"
+                f"  Sampling rate: {ctx['sampling_rate']} Hz\n"
+                f"  Window duration: {ctx['window_duration_sec']:.2f} seconds\n\n"
+            )
+        else:
+            sensor_section = (
+                "SENSOR SETUP:\n"
+                "  Device: IMU (Inertial Measurement Unit) worn on the body\n"
+                "  Channels: 6 (accelerometer xyz + gyroscope xyz)\n\n"
+            )
+
+        options_str = "\n".join(
+            f"  {i+1}. {opt}" for i, opt in enumerate(self.activity_options)
+        )
+
+        prompt = (
+            f"{sensor_section}"
+            "The following neuro-symbolic description was generated by a neural network "
+            "that processed the raw IMU sensor data. Each symbolic statement describes "
+            "detected motion patterns, postures, gait characteristics, and intensities "
+            "from the sensor readings.\n\n"
+            "NEURO-SYMBOLIC DESCRIPTION:\n"
+            f"{symbolic_text}\n\n"
+            "Given the above sensor context and symbolic description, the person was "
+            "performing ONE of these activities:\n"
+            f"{options_str}\n\n"
+            "Which activity best matches the symbolic description? "
+            "Respond with ONLY the activity text (copy exactly from the list), nothing else."
+        )
 
         try:
             response = self.client.responses.create(
                 model=self.config.reward_model,
                 input=prompt,
-                temperature=self.config.reward_temperature,
+                temperature=0.1,  # very low for consistent classification
             )
-            result = response.output_text.strip()
-            return self._parse_reward_response(result)
+            predicted = response.output_text.strip().lower()
+
+            # Match to closest option
+            best_match = self._match_to_option(predicted)
+            return best_match
         except Exception as e:
-            print(f"[RewardFunction] OpenAI API error: {e}")
-            return 0.0, "unknown"
+            print(f"[RewardFunction] OpenAI classification error: {e}")
+            return "unknown"
+
+    def _match_to_option(self, predicted: str) -> str:
+        """Match OpenAI's response to the closest activity option."""
+        pred_lower = predicted.lower().strip()
+        # Exact match
+        for opt in self.activity_options:
+            if opt.lower() == pred_lower:
+                return opt
+        # Substring match
+        for opt in self.activity_options:
+            if opt.lower() in pred_lower or pred_lower in opt.lower():
+                return opt
+        # Word overlap match
+        pred_words = set(pred_lower.split())
+        best_overlap = 0
+        best_opt = self.activity_options[0] if self.activity_options else "unknown"
+        for opt in self.activity_options:
+            opt_words = set(opt.lower().split())
+            overlap = len(pred_words & opt_words)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_opt = opt
+        return best_opt
+
+    def _compute_classification_reward(self, predicted: str, ground_truth: str) -> float:
+        """
+        Simple classification reward:
+          - Correct:  +1.0
+          - Related:  +0.3 (e.g., walking vs walking_upstairs)
+          - Wrong:    -0.1
+        """
+        pred_lower = predicted.lower().strip()
+        gt_lower = ground_truth.lower().strip()
+
+        # Exact or near-exact match
+        if pred_lower == gt_lower or pred_lower in gt_lower or gt_lower in pred_lower:
+            return self.config.correct_reward
+
+        # Check word overlap — if most words match, it's correct
+        pred_words = set(pred_lower.split())
+        gt_words = set(gt_lower.split())
+        if pred_words and gt_words:
+            overlap = len(pred_words & gt_words)
+            union = len(pred_words | gt_words)
+            if overlap / union > 0.5:
+                return self.config.correct_reward
+
+        # Related activity (partial credit)
+        if _activities_related(predicted, ground_truth):
+            return self.config.partial_reward
+
+        return self.config.wrong_reward
 
     def batch_compute_rewards(
         self,
@@ -90,63 +273,96 @@ class OpenAIRewardFunction:
         results = []
         for text, gt in zip(symbolic_texts, ground_truths):
             results.append(self.compute_reward(text, gt))
-            time.sleep(0.1)  # Rate limiting
+            time.sleep(0.05)  # Rate limiting (lighter since single call now)
 
         return results
 
-    def _build_reward_prompt(self, symbolic_text: str, ground_truth: Optional[str]) -> str:
+    def _interpret_symbolic(self, symbolic_text: str) -> str:
+        """Fallback: free-form interpretation with sensor context."""
+        # Build sensor context
+        if self.sensor_context:
+            ctx = self.sensor_context
+            channels_str = ", ".join(ctx.get("channel_names", []))
+            context_str = (
+                f"The data comes from a {ctx['num_channels']}-channel IMU "
+                f"({channels_str}) sampled at {ctx['sampling_rate']}Hz, "
+                f"recording {ctx['window_duration_sec']:.1f} seconds of movement.\n\n"
+            )
+        else:
+            context_str = ""
+
         prompt = (
-            "You are evaluating a neuro-symbolic translation of IMU sensor data.\n\n"
-            "NEURO-SYMBOLIC OUTPUT:\n"
+            "You are interpreting a neuro-symbolic description generated from "
+            "IMU (Inertial Measurement Unit) sensor data worn by a person.\n\n"
+            f"{context_str}"
+            "NEURO-SYMBOLIC DESCRIPTION:\n"
             f"{symbolic_text}\n\n"
+            "Based ONLY on the above symbolic description, what physical activity "
+            "is the person most likely performing?\n\n"
+            "Respond with ONLY a short activity label (1-5 words), nothing else.\n"
+            "Examples: walking, running, sitting still, jumping rope, waving hand"
         )
-        if ground_truth:
-            prompt += f"GROUND TRUTH ACTIVITY: {ground_truth}\n\n"
 
-        prompt += (
-            "Rate this output on a scale of 0 to 10 based on:\n"
-            "1. CLARITY: Are the statements clear and well-formed?\n"
-            "2. SPECIFICITY: Do they describe a recognizable human activity?\n"
-            "3. COHERENCE: Are the statements internally consistent?\n"
-        )
-        if ground_truth:
-            prompt += "4. ACCURACY: Does the description match the ground truth?\n"
-
-        prompt += (
-            "\nRespond in exactly this JSON format:\n"
-            '{"score": <0-10>, "activity": "<what the person is doing>", '
-            '"reasoning": "<brief explanation>"}\n'
-        )
-        return prompt
-
-    def _parse_reward_response(self, response: str) -> Tuple[float, str]:
-        """Parse the structured JSON reward response."""
         try:
-            # Try to extract JSON from response
-            # Handle markdown code blocks
-            if "```" in response:
-                json_str = response.split("```")[1]
-                if json_str.startswith("json"):
-                    json_str = json_str[4:]
-                json_str = json_str.strip()
-            else:
-                json_str = response
+            response = self.client.responses.create(
+                model=self.config.reward_model,
+                input=prompt,
+                temperature=self.config.reward_temperature,
+            )
+            return response.output_text.strip().lower()
+        except Exception as e:
+            print(f"[RewardFunction] OpenAI interpretation error: {e}")
+            return "unknown"
 
-            data = json.loads(json_str)
-            score = float(data.get("score", 0))
-            activity = data.get("activity", "unknown")
-            # Normalize to [0, 1]
-            reward = max(0.0, min(1.0, score / 10.0))
-            return reward, activity
-        except (json.JSONDecodeError, KeyError, ValueError):
-            # Fallback: try to extract a number
+    def _compute_match_reward(self, predicted: str, ground_truth: str) -> float:
+        """Fallback: semantic similarity via OpenAI (2-step)."""
+        prompt = (
+            "Compare these two activity descriptions and rate their semantic similarity.\n\n"
+            f"PREDICTED: {predicted}\n"
+            f"ACTUAL: {ground_truth}\n\n"
+            "Rate similarity from 0 to 10:\n"
+            "  0 = completely different activities\n"
+            "  5 = somewhat related\n"
+            "  10 = same activity (even if worded differently)\n\n"
+            "Respond with ONLY a number (0-10), nothing else."
+        )
+
+        try:
+            response = self.client.responses.create(
+                model=self.config.reward_model,
+                input=prompt,
+                temperature=0.1,
+            )
+            score_str = response.output_text.strip()
             import re
-            numbers = re.findall(r'(\d+\.?\d*)', response)
+            numbers = re.findall(r'(\d+\.?\d*)', score_str)
             if numbers:
                 score = float(numbers[0])
-                reward = max(0.0, min(1.0, score / 10.0))
-                return reward, "unknown"
-            return 0.0, "unknown"
+                return max(0.0, min(1.0, score / 10.0))
+            return 0.0
+        except Exception as e:
+            print(f"[RewardFunction] Matching error: {e}")
+            return self._simple_match(predicted, ground_truth)
+
+    @staticmethod
+    def _simple_match(predicted: str, ground_truth: str) -> float:
+        """Fallback string-based matching when API fails."""
+        pred = predicted.lower().strip()
+        gt = ground_truth.lower().strip()
+        if gt in pred or pred in gt:
+            return 0.8
+        pred_words = set(pred.split())
+        gt_words = set(gt.split())
+        if pred_words & gt_words:
+            overlap = len(pred_words & gt_words) / max(len(pred_words | gt_words), 1)
+            return overlap * 0.7
+        return 0.0
+
+    @staticmethod
+    def _is_parseable(symbolic_text: str) -> bool:
+        """Check if the symbolic text has any recognizable structure."""
+        import re
+        return bool(re.search(r'[A-Z]+\(.*\)', symbolic_text))
 
 
 # ============================================================================
@@ -198,10 +414,11 @@ class PPOTrainer:
     """
     Proximal Policy Optimization for the Translator.
 
-    Workflow:
-      1. Collect experiences (generate → get reward)
-      2. Compute advantages
-      3. PPO update (multiple epochs over the batch)
+    v2 improvements:
+      - Running reward normalization (mean/std tracking)
+      - LR warmup + cosine decay schedule
+      - Entropy coefficient annealing
+      - Better advantage estimation
     """
 
     def __init__(
@@ -216,16 +433,43 @@ class PPOTrainer:
         self.config = config
         self.device = device
 
-        self.optimizer = AdamW(model.parameters(), lr=config.lr)
+        self.optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=0.01)
+
+        # LR schedule: warmup + cosine decay
+        def lr_lambda(step):
+            if step < config.warmup_steps:
+                return float(step + 1) / float(max(1, config.warmup_steps))
+            progress = float(step - config.warmup_steps) / float(
+                max(1, config.total_updates - config.warmup_steps)
+            )
+            return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+        self.scheduler = LambdaLR(self.optimizer, lr_lambda)
+
         self.reward_fn = OpenAIRewardFunction(config)
         self.buffer = ExperienceBuffer()
+
+        # Running reward statistics for normalization
+        self.reward_history = deque(maxlen=200)
+        self.reward_running_mean = 0.0
+        self.reward_running_var = 1.0
 
         # Moving average baseline
         self.baseline = 0.0
         self.num_updates = 0
 
+        # Current entropy coefficient (decays over time)
+        self.current_entropy_coef = config.entropy_coef
+
         # Logging
         self.train_log: List[Dict] = []
+
+    def decay_entropy(self):
+        """Call at the end of each epoch to decay entropy coefficient."""
+        self.current_entropy_coef = max(
+            self.config.entropy_coef_min,
+            self.current_entropy_coef * self.config.entropy_decay,
+        )
 
     def collect_experience(
         self,
@@ -276,25 +520,43 @@ class PPOTrainer:
 
     def compute_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
         """
-        Compute advantages using a simple moving average baseline.
+        Compute advantages using running normalization + baseline.
 
-        Args:
-            rewards: (B,) batch of rewards
-
-        Returns:
-            advantages: (B,) normalized advantages
+        v2: uses tracked reward statistics for more stable normalization.
         """
-        # Update baseline
+        # Update reward history
+        for r in rewards.tolist():
+            self.reward_history.append(r)
+
+        # Update running stats
+        if len(self.reward_history) > 1:
+            hist = list(self.reward_history)
+            self.reward_running_mean = sum(hist) / len(hist)
+            self.reward_running_var = max(
+                sum((r - self.reward_running_mean) ** 2 for r in hist) / len(hist),
+                0.01,
+            )
+
+        # Update baseline with momentum
         mean_reward = rewards.mean().item()
         self.baseline = (
             self.config.baseline_momentum * self.baseline
             + (1 - self.config.baseline_momentum) * mean_reward
         )
 
-        advantages = rewards - self.baseline
-        # Normalize
+        # Normalize rewards using running statistics
+        if self.config.normalize_rewards and len(self.reward_history) > 10:
+            rewards_norm = (rewards - self.reward_running_mean) / (
+                self.reward_running_var ** 0.5 + 1e-8
+            )
+            advantages = rewards_norm
+        else:
+            advantages = rewards - self.baseline
+
+        # Normalize advantages per batch
         if advantages.std() > 1e-8:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
         return advantages
 
     def ppo_update(self) -> Dict[str, float]:
@@ -391,14 +653,14 @@ class PPOTrainer:
             value_pred = (values * valid_mask).sum(dim=1) / (valid_mask.sum(dim=1) + 1e-8)
             value_loss = F.mse_loss(value_pred, returns)
 
-            # Entropy bonus
+            # Entropy bonus (with annealing)
             entropy_loss = -(entropy * valid_mask).sum() / valid_count
 
-            # Total loss
+            # Total loss — use current (decayed) entropy coefficient
             loss = (
                 policy_loss
                 + self.config.value_coef * value_loss
-                + self.config.entropy_coef * entropy_loss
+                + self.current_entropy_coef * entropy_loss
             )
 
             self.optimizer.zero_grad()
@@ -411,6 +673,9 @@ class PPOTrainer:
             total_value_loss += value_loss.item()
             total_entropy_loss += entropy_loss.item()
 
+        # Step LR schedule
+        self.scheduler.step()
+
         n = self.config.ppo_epochs
         metrics = {
             "loss": total_loss / n,
@@ -420,6 +685,9 @@ class PPOTrainer:
             "mean_reward": rewards.mean().item(),
             "baseline": self.baseline,
             "buffer_size": len(self.buffer),
+            "lr": self.optimizer.param_groups[0]["lr"],
+            "entropy_coef": self.current_entropy_coef,
+            "reward_running_mean": self.reward_running_mean,
         }
         self.train_log.append(metrics)
         self.num_updates += 1
@@ -436,10 +704,14 @@ class PPOTrainer:
         torch.save({
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
             "config": self.config,
             "baseline": self.baseline,
             "num_updates": self.num_updates,
             "train_log": self.train_log,
+            "current_entropy_coef": self.current_entropy_coef,
+            "reward_running_mean": self.reward_running_mean,
+            "reward_running_var": self.reward_running_var,
         }, path)
         print(f"[PPOTrainer] Checkpoint saved: {path}")
 
@@ -449,12 +721,19 @@ class PPOTrainer:
         if not os.path.exists(path):
             print(f"[PPOTrainer] No checkpoint found at {path}")
             return
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "scheduler_state_dict" in checkpoint:
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         self.baseline = checkpoint.get("baseline", 0.0)
         self.num_updates = checkpoint.get("num_updates", 0)
         self.train_log = checkpoint.get("train_log", [])
+        self.current_entropy_coef = checkpoint.get(
+            "current_entropy_coef", self.config.entropy_coef
+        )
+        self.reward_running_mean = checkpoint.get("reward_running_mean", 0.0)
+        self.reward_running_var = checkpoint.get("reward_running_var", 1.0)
         print(f"[PPOTrainer] Checkpoint loaded: {path} (update #{self.num_updates})")
 
 

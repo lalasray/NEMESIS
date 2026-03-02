@@ -96,6 +96,7 @@ class NemesisPipeline:
 
         # --- Components ---
         self.device = device
+        self.use_vqvae = use_vqvae
         if use_vqvae:
             self.tokenizer = VQVAE_Tokenizer(imu_config)
         else:
@@ -115,11 +116,98 @@ class NemesisPipeline:
         self._try_load_checkpoint()
 
         print(f"[NEMESIS] Pipeline initialized")
-        print(f"  IMU Tokenizer: {'VQ-VAE' if use_vqvae else 'Binning'}")
+        tok_name = 'VQ-VAE' if use_vqvae else 'Binning'
+        if use_vqvae:
+            tok_name += ' (NEEDS PRE-TRAINING)' if not self.tokenizer.is_trained else ' (trained)'
+        print(f"  IMU Tokenizer: {tok_name}")
         print(f"  Translator: {sum(p.numel() for p in self.translator.parameters()):,} params")
         print(f"  Symbolic vocab: {self.vocab.size} tokens")
         print(f"  Memory: {self.memory.get_stats()}")
         print(f"  Device: {device}")
+
+    def set_activity_options(self, options: List[str]):
+        """
+        Set the valid activity descriptions for classification-style reward.
+        Must be called before training for classify_reward mode.
+        """
+        self.rl_trainer.reward_fn.set_activity_options(options)
+        print(f"[NEMESIS] Activity options set: {len(options)} classes")
+
+    def set_sensor_context(
+        self,
+        num_channels: int = 6,
+        channel_names: List[str] = None,
+        sampling_rate: int = 50,
+        window_duration_sec: float = 2.56,
+    ):
+        """
+        Set IMU sensor context that gets included in OpenAI prompts.
+        This helps OpenAI understand what the symbolic text represents.
+        """
+        if channel_names is None:
+            channel_names = [f"ch_{i}" for i in range(num_channels)]
+        self._sensor_context = {
+            "num_channels": num_channels,
+            "channel_names": channel_names,
+            "sampling_rate": sampling_rate,
+            "window_duration_sec": window_duration_sec,
+        }
+        # Propagate to reward function
+        self.rl_trainer.reward_fn.set_sensor_context(self._sensor_context)
+        print(f"[NEMESIS] Sensor context set: {num_channels}ch @ {sampling_rate}Hz, "
+              f"{window_duration_sec:.2f}s windows")
+
+    def pretrain_tokenizer(
+        self,
+        imu_data_list: List[np.ndarray],
+        num_epochs: int = 50,
+        batch_size: int = 256,
+        lr: float = 1e-3,
+    ):
+        """
+        Pre-train the VQ-VAE tokenizer on raw IMU data (unsupervised).
+
+        This MUST be called before RL training when use_vqvae=True.
+        It learns a codebook of motion primitives by reconstructing
+        IMU signals — no labels needed.
+
+        Uses the reference architecture:
+          - Channels-first Conv1d encoder with residual blocks
+          - VectorQuantizerEMA with decay=0.99
+          - Reconstruction loss normalised by data variance
+          - Perplexity tracking for codebook health
+
+        Args:
+            imu_data_list: List of (T, C) raw IMU sequences from the dataset
+            num_epochs: VQ-VAE training epochs
+            batch_size: Batch size (reference uses 1024, reduced for CPU)
+            lr: Learning rate
+        """
+        if not self.use_vqvae:
+            print("[NEMESIS] Skipping VQ-VAE pre-training (using BinningTokenizer)")
+            return
+
+        if not isinstance(self.tokenizer, VQVAE_Tokenizer):
+            raise TypeError("Tokenizer is not a VQ-VAE — can't pre-train")
+
+        print("\n--- VQ-VAE Pre-training (unsupervised) ---")
+        print(f"  Learning motion primitives from {len(imu_data_list)} IMU sequences")
+        print(f"  This is UNSUPERVISED — no labels needed, just reconstruction")
+
+        metrics = self.tokenizer.train_vqvae(
+            imu_data_list=imu_data_list,
+            num_epochs=num_epochs,
+            batch_size=batch_size,
+            lr=lr,
+            device=self.device,
+        )
+
+        # Save the VQ-VAE weights
+        vqvae_path = os.path.join(CHECKPOINTS_DIR, "vqvae_pretrained.pt")
+        os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
+        self.tokenizer.save_pretrained(vqvae_path)
+
+        return metrics
 
     def start_session(self, notes: str = ""):
         """Start a new session — enables cross-session memory tracking."""
@@ -198,10 +286,29 @@ class NemesisPipeline:
             embedding = self._compute_embedding(imu_tokens)
             memory_context = self.memory.get_context_for_prompt(embedding)
 
-        # Step 4: Ask OpenAI to interpret
-        activity, confidence = self._interpret_with_openai(symbolic_text, memory_context)
+        # Step 4: Get activity prediction
+        # In classify mode: single API call picks from known activities
+        # In interpret mode: free-form interpretation
+        if (self.rl_config.classify_reward
+                and self.rl_trainer.reward_fn.activity_options):
+            activity = self.rl_trainer.reward_fn._classify_symbolic(symbolic_text)
+        else:
+            activity = self._interpret_with_openai(symbolic_text, memory_context)
 
-        # Step 5: Store in memory
+        # Step 5: Compute reward
+        if ground_truth is not None:
+            if self.rl_config.classify_reward:
+                confidence = self.rl_trainer.reward_fn._compute_classification_reward(
+                    activity, ground_truth
+                )
+            else:
+                confidence = self.rl_trainer.reward_fn._compute_match_reward(
+                    activity, ground_truth
+                )
+        else:
+            confidence = 0.1 if self.rl_trainer.reward_fn._is_parseable(symbolic_text) else 0.0
+
+        # Step 6: Store in memory
         if use_memory:
             embedding = self._compute_embedding(imu_tokens)
             self.memory.store_translation(
@@ -212,7 +319,7 @@ class NemesisPipeline:
                 embedding=embedding,
             )
 
-        # Step 6: Collect RL experience
+        # Step 7: Collect RL experience
         if train:
             from nemesis.rl_trainer import Experience
             exp = Experience(
@@ -238,64 +345,80 @@ class NemesisPipeline:
     # Training
     # ---------------------------------------------------------------
 
-    def supervised_pretrain(
+    def warm_start(
         self,
-        activities: List[str] = None,
-        num_epochs: int = 50,
-        samples_per_activity: int = 10,
+        num_epochs: int = 30,
+        samples_per_epoch: int = 50,
     ):
         """
-        Pretrain the Translator with synthetic IMU → symbolic pairs.
+        Warm-start the Translator to produce syntactically valid symbolic
+        tokens (but NOT semantically correct ones).
 
-        Args:
-            activities: list of activity names to train on
-            num_epochs: number of training epochs
-            samples_per_activity: samples to generate per activity
+        This does NOT teach the model what the "correct" symbolic output is
+        — we don't have ground truth for that. It only teaches:
+          - Generate tokens from the symbolic vocabulary
+          - Produce PREDICATE(key=value) structure
+          - End with EOS
+
+        The actual semantic meaning is learned via RL (OpenAI reward).
+
+        Uses randomly shuffled templates as diverse structural targets.
         """
-        if activities is None:
-            activities = ["walking", "running", "sitting", "jumping", "waving"]
+        import random
+        from nemesis.neuro_symbolic import (
+            SymbolicStatement, SymbolicProgram,
+            ACTIVITY_TEMPLATES,
+        )
 
         pretrainer = SupervisedPretrainer(
             self.translator, self.vocab, lr=1e-3, device=self.device
         )
 
-        print(f"[Pretrain] Starting supervised pretraining: {num_epochs} epochs")
+        # Collect ALL template statements (from every activity)
+        all_statements = []
+        for stmts in ACTIVITY_TEMPLATES.values():
+            all_statements.extend(stmts)
+
+        activities = list(ACTIVITY_TEMPLATES.keys())
+
+        print(f"[WarmStart] Teaching syntactic structure: {num_epochs} epochs")
+        print(f"  NOTE: This only teaches token structure, not semantic meaning.")
+        print(f"  Semantic learning happens during RL with OpenAI reward.")
 
         for epoch in range(num_epochs):
             epoch_loss = 0.0
             num_batches = 0
 
-            for activity in activities:
-                for _ in range(samples_per_activity):
-                    # Generate synthetic IMU
-                    imu_data = generate_synthetic_imu(activity, duration_sec=3.0)
+            for _ in range(samples_per_epoch):
+                # Pick a random activity for IMU generation
+                activity = random.choice(activities)
+                imu_data = generate_synthetic_imu(activity, duration_sec=3.0)
+                imu_tokens = self.tokenizer.tokenize(imu_data)
 
-                    # Tokenize IMU
-                    if isinstance(self.tokenizer, BinningTokenizer):
-                        imu_tokens = self.tokenizer.tokenize(imu_data)
-                    else:
-                        imu_tokens = self.tokenizer.tokenize(imu_data)
+                # Create a RANDOM symbolic program (shuffled statements)
+                # This teaches structure, not correct mapping
+                num_stmts = random.randint(2, 5)
+                stmts = random.sample(all_statements, min(num_stmts, len(all_statements)))
+                program = SymbolicProgram(statements=stmts)
+                sym_ids = self.vocab.encode(program.to_string())
 
-                    # Get template symbolic output
-                    program = get_template_program(activity)
-                    sym_ids = self.vocab.encode(program.to_string())
+                # Prepare tensors
+                src = torch.tensor([imu_tokens], dtype=torch.long)
+                tgt = torch.tensor([sym_ids], dtype=torch.long)
+                src_mask = torch.ones(1, len(imu_tokens), dtype=torch.bool)
+                tgt_mask = torch.ones(1, len(sym_ids), dtype=torch.bool)
 
-                    # Prepare tensors
-                    src = torch.tensor([imu_tokens], dtype=torch.long)
-                    tgt = torch.tensor([sym_ids], dtype=torch.long)
-                    src_mask = torch.ones(1, len(imu_tokens), dtype=torch.bool)
-                    tgt_mask = torch.ones(1, len(sym_ids), dtype=torch.bool)
-
-                    loss = pretrainer.train_step(src, tgt, src_mask, tgt_mask)
-                    epoch_loss += loss
-                    num_batches += 1
+                loss = pretrainer.train_step(src, tgt, src_mask, tgt_mask)
+                epoch_loss += loss
+                num_batches += 1
 
             avg_loss = epoch_loss / max(1, num_batches)
             if (epoch + 1) % 10 == 0:
                 print(f"  Epoch {epoch + 1}/{num_epochs} — loss: {avg_loss:.4f}")
 
-        print("[Pretrain] Done!")
-        self.rl_trainer.save_checkpoint("pretrained")
+        print("[WarmStart] Done! Model can now produce structured symbolic tokens.")
+        print("  Run rl_train_step() to teach it the CORRECT symbolic mappings.")
+        self.rl_trainer.save_checkpoint("warmstart")
 
     def rl_train_step(self) -> Optional[Dict]:
         """
@@ -320,22 +443,35 @@ class NemesisPipeline:
         self,
         symbolic_text: str,
         memory_context: str = "",
-    ) -> Tuple[str, float]:
+    ) -> str:
         """
-        Send symbolic output to OpenAI for interpretation and scoring.
+        Send symbolic output to OpenAI for interpretation with sensor context.
 
-        Returns:
-            (activity_description, confidence_score)
+        OpenAI NEVER sees the ground truth. It only interprets the
+        symbolic text and predicts what activity it describes.
         """
-        prompt = memory_context + (
+        # Build sensor context
+        ctx = getattr(self, '_sensor_context', None)
+        if ctx:
+            channels_str = ", ".join(ctx.get("channel_names", []))
+            sensor_intro = (
+                f"A person is wearing an IMU sensor ({ctx['num_channels']} channels: "
+                f"{channels_str}) sampled at {ctx['sampling_rate']}Hz. "
+                f"The following neuro-symbolic description was generated from "
+                f"{ctx['window_duration_sec']:.1f} seconds of their sensor data.\n\n"
+            )
+        else:
+            sensor_intro = ""
+
+        prompt = memory_context + sensor_intro + (
             "You are NEMESIS, an AI that interprets neuro-symbolic descriptions "
             "of IMU sensor data to determine what physical activity a person is performing.\n\n"
-            "NEURO-SYMBOLIC INPUT:\n"
+            "NEURO-SYMBOLIC DESCRIPTION:\n"
             f"{symbolic_text}\n\n"
-            "Respond in this exact JSON format:\n"
-            '{"activity": "<concise activity description>", '
-            '"confidence": <0.0-1.0>, '
-            '"details": "<brief explanation>"}\n'
+            "Based ONLY on the symbolic description above, what physical activity "
+            "is the person most likely performing?\n\n"
+            "Respond with ONLY a short activity label (1-5 words), nothing else.\n"
+            "Examples: walking, running, sitting still, jumping rope, waving hand"
         )
 
         try:
@@ -344,31 +480,10 @@ class NemesisPipeline:
                 input=prompt,
                 temperature=0.3,
             )
-            result = response.output_text.strip()
-            return self._parse_openai_response(result)
+            return response.output_text.strip().lower()
         except Exception as e:
             print(f"[OpenAI] Error: {e}")
-            return "unknown activity", 0.0
-
-    def _parse_openai_response(self, response: str) -> Tuple[str, float]:
-        """Parse OpenAI JSON response."""
-        import json
-        try:
-            # Handle markdown code blocks
-            if "```" in response:
-                json_str = response.split("```")[1]
-                if json_str.startswith("json"):
-                    json_str = json_str[4:]
-                json_str = json_str.strip()
-            else:
-                json_str = response
-
-            data = json.loads(json_str)
-            activity = data.get("activity", "unknown")
-            confidence = float(data.get("confidence", 0.0))
-            return activity, confidence
-        except (json.JSONDecodeError, ValueError):
-            return response[:100], 0.3  # fallback
+            return "unknown"
 
     # ---------------------------------------------------------------
     # Helpers
@@ -425,26 +540,31 @@ def demo():
     pipeline = NemesisPipeline(device="cpu")
     pipeline.start_session("demo session")
 
-    # Step 1: Supervised pretraining
-    print("\n--- Phase 1: Supervised Pretraining ---")
-    pipeline.supervised_pretrain(num_epochs=20, samples_per_activity=5)
+    # Step 1: Warm start (teaches syntax, NOT semantics)
+    print("\n--- Phase 1: Warm Start (syntactic structure only) ---")
+    pipeline.warm_start(num_epochs=20, samples_per_epoch=20)
 
     # Step 2: Translate some IMU data
-    print("\n--- Phase 2: Translation ---")
+    # Ground truth is the ACTIVITY LABEL, not the symbolic output
+    print("\n--- Phase 2: Translation + RL Collection ---")
+    print("  (OpenAI interprets symbolic output → compared to ground truth label)")
     activities = ["walking", "running", "sitting", "jumping", "waving"]
 
     for activity in activities:
         print(f"\n[Testing: {activity}]")
         imu_data = generate_synthetic_imu(activity, duration_sec=3.0)
+
+        # ground_truth = activity label (the only supervision we have)
         result = pipeline.translate(imu_data, ground_truth=activity)
 
-        print(f"  Symbolic: {result.symbolic_text[:80]}...")
-        print(f"  Activity: {result.activity}")
-        print(f"  Confidence: {result.confidence:.2f}")
-        print(f"  From cache: {result.from_cache}")
+        print(f"  Symbolic (latent):  {result.symbolic_text[:80]}...")
+        print(f"  OpenAI predicted:   {result.activity}")
+        print(f"  Reward (match GT):  {result.confidence:.2f}")
+        print(f"  From cache:         {result.from_cache}")
 
-    # Step 3: RL update
+    # Step 3: RL update — uses accumulated rewards to improve Translator
     print("\n--- Phase 3: RL Update ---")
+    print("  Updating Translator so its symbolic outputs lead OpenAI to correct activities")
     metrics = pipeline.rl_train_step()
     if metrics:
         print(f"  Metrics: {metrics}")

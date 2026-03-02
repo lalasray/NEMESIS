@@ -1,2 +1,7 @@
 
 apikey.txt
+/checkpoints
+/datasets
+/nemesis/__pycache__
+*.json
+/memory_store

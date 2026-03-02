@@ -55,7 +55,9 @@ class MemoryEntry:
 
 def compute_entry_id(symbolic_text: str, imu_tokens: List[int]) -> str:
     """Deterministic ID from content."""
-    content = f"{symbolic_text}|{json.dumps(imu_tokens)}"
+    # Convert numpy ints to plain Python ints for JSON serialization
+    tokens = [int(t) for t in imu_tokens]
+    content = f"{symbolic_text}|{json.dumps(tokens)}"
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 
@@ -451,7 +453,7 @@ class MemoryManager:
             activity=activity,
             confidence=confidence,
             timestamp=time.time(),
-            imu_tokens_json=json.dumps(imu_tokens),
+            imu_tokens_json=json.dumps([int(t) for t in imu_tokens]),
         )
 
         # Store in knowledge graph
