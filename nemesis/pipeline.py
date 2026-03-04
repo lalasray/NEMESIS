@@ -346,6 +346,110 @@ class NemesisPipeline:
             memory_context=memory_context,
         )
 
+    def translate_batch(
+        self,
+        imu_batch: List[np.ndarray],
+        ground_truths: Optional[List[str]] = None,
+        train: bool = True,
+        temperature: float = 1.0,
+        class_weights: Optional[List[float]] = None,
+        max_workers: int = 8,
+    ) -> List[TranslationResult]:
+        """
+        Batched pipeline: processes multiple IMU segments with parallel OpenAI calls.
+
+        Steps:
+          1. Tokenize all samples (serial, fast)
+          2. Generate symbolic text for all (serial, local model)
+          3. Classify all with OpenAI in PARALLEL (ThreadPoolExecutor)
+          4. Compute rewards and collect RL experience
+
+        This is ~8x faster than serial translate() for I/O bound API calls.
+        """
+        B = len(imu_batch)
+        if ground_truths is None:
+            ground_truths = [None] * B
+        if class_weights is None:
+            class_weights = [1.0] * B
+
+        # --- Step 1+2: Tokenize and generate symbolic (serial, fast) ---
+        all_imu_tokens = []
+        all_src_ids = []
+        all_generated = []
+        all_log_probs = []
+        all_symbolic = []
+
+        self.translator.eval()
+        for imu_data in imu_batch:
+            imu_tokens = self.tokenizer.tokenize(imu_data)
+            src_ids = torch.tensor([imu_tokens], dtype=torch.long)
+            src_mask = torch.ones(1, len(imu_tokens), dtype=torch.bool)
+
+            generated, log_probs = self.translator.generate(
+                src_ids.to(self.device),
+                src_mask.to(self.device),
+                temperature=temperature,
+                bos_id=self.vocab.bos_id,
+                eos_id=self.vocab.eos_id,
+                sample=(temperature > 0),
+            )
+            symbolic_text = self.vocab.decode(generated[0].tolist())
+
+            all_imu_tokens.append(imu_tokens)
+            all_src_ids.append(src_ids)
+            all_generated.append(generated)
+            all_log_probs.append(log_probs)
+            all_symbolic.append(symbolic_text)
+
+        # --- Step 3: Parallel OpenAI classification ---
+        reward_fn = self.rl_trainer.reward_fn
+        if self.rl_config.classify_reward and reward_fn.activity_options:
+            activities = reward_fn.classify_batch_parallel(all_symbolic, max_workers=max_workers)
+        else:
+            # Fallback: serial interpretation
+            activities = [self._interpret_with_openai(s, "") for s in all_symbolic]
+
+        # --- Step 4: Compute rewards and collect experience ---
+        results = []
+        for i in range(B):
+            gt = ground_truths[i]
+            cw = class_weights[i]
+            activity = activities[i]
+            symbolic_text = all_symbolic[i]
+            imu_tokens = all_imu_tokens[i]
+
+            if gt is not None:
+                if self.rl_config.classify_reward:
+                    confidence = reward_fn._compute_classification_reward(
+                        activity, gt, class_weight=cw)
+                else:
+                    confidence = reward_fn._compute_match_reward(activity, gt)
+            else:
+                confidence = 0.1 if reward_fn._is_parseable(symbolic_text) else 0.0
+
+            if train:
+                from nemesis.rl_trainer import Experience
+                exp = Experience(
+                    src_ids=all_src_ids[i][0].cpu(),
+                    tgt_ids=all_generated[i][0].cpu(),
+                    log_probs=all_log_probs[i][0].cpu(),
+                    reward=confidence,
+                    activity=activity,
+                    symbolic_text=symbolic_text,
+                )
+                self.rl_trainer.buffer.add(exp)
+
+            results.append(TranslationResult(
+                symbolic_text=symbolic_text,
+                activity=activity,
+                confidence=confidence,
+                from_cache=False,
+                imu_tokens=imu_tokens,
+                memory_context="",
+            ))
+
+        return results
+
     # ---------------------------------------------------------------
     # Training
     # ---------------------------------------------------------------

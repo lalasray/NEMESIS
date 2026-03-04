@@ -290,6 +290,40 @@ class OpenAIRewardFunction:
 
         return results
 
+    def classify_batch_parallel(
+        self,
+        symbolic_texts: List[str],
+        max_workers: int = 8,
+    ) -> List[str]:
+        """
+        Classify a batch of symbolic texts in parallel using ThreadPoolExecutor.
+
+        This is the main speedup: OpenAI API calls are I/O-bound, so we can
+        fire many concurrently. With 8 workers, ~8x faster than serial.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        activities = [None] * len(symbolic_texts)
+
+        def _classify_one(idx_text):
+            idx, text = idx_text
+            # Check cache first
+            cache_key = hash(text)
+            if cache_key in self._cache:
+                return idx, self._cache[cache_key][1]
+            activity = self._classify_symbolic(text)
+            self._cache[cache_key] = (0.0, activity)
+            return idx, activity
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_classify_one, (i, t))
+                       for i, t in enumerate(symbolic_texts)]
+            for future in as_completed(futures):
+                idx, activity = future.result()
+                activities[idx] = activity
+
+        return activities
+
     def _interpret_symbolic(self, symbolic_text: str) -> str:
         """Fallback: free-form interpretation with sensor context."""
         # Build sensor context

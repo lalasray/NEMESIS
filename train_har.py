@@ -82,22 +82,16 @@ def evaluate(
     dataset: HARDataset,
     max_samples: int = 0,
     verbose: bool = True,
+    api_workers: int = 8,
 ) -> Dict:
     """
-    Evaluate the pipeline on a test set.
-
-    For each sample:
-      1. Translator generates symbolic text
-      2. OpenAI classifies it (picks from known activities)
-      3. Compare classification to ground truth
+    Evaluate the pipeline on a test set with parallel OpenAI calls.
 
     Primary metric: **macro F1** (handles class imbalance).
 
     Args:
         max_samples: 0 = use entire dataset
-
-    Returns:
-        Dictionary with macro_f1, accuracy, per-class precision/recall/f1
+        api_workers: number of parallel OpenAI API threads
     """
     reward_fn = pipeline.rl_trainer.reward_fn
 
@@ -106,55 +100,62 @@ def evaluate(
 
     correct = 0
     total = 0
-    per_class_correct = defaultdict(int)   # true positives per class
-    per_class_total = defaultdict(int)      # support (ground-truth count)
-    per_class_predicted = defaultdict(int)  # predicted count
+    per_class_correct = defaultdict(int)
+    per_class_total = defaultdict(int)
+    per_class_predicted = defaultdict(int)
     results = []
 
-    print(f"\n[Eval] Evaluating on {n} samples from {dataset.dataset_name}/{dataset.split}...")
+    eval_batch_size = max(api_workers, 16)  # process in batches
 
-    for i in range(n):
-        imu_data, description, label = dataset.get_sample(i)
+    print(f"\n[Eval] Evaluating on {n} samples (workers={api_workers})...")
 
-        # Translate (no training, no memory writes)
-        result = pipeline.translate(
-            imu_data,
-            ground_truth=description,
-            use_memory=False,
+    for batch_start in range(0, n, eval_batch_size):
+        batch_end = min(batch_start + eval_batch_size, n)
+
+        imu_batch = []
+        gt_batch = []
+        labels_batch = []
+        for i in range(batch_start, batch_end):
+            imu_data, description, label = dataset.get_sample(i)
+            imu_batch.append(imu_data)
+            gt_batch.append(description)
+            labels_batch.append(label)
+
+        # Batched translate with parallel API (no training, no memory)
+        batch_results = pipeline.translate_batch(
+            imu_batch,
+            ground_truths=gt_batch,
             train=False,
             temperature=0.3,
+            max_workers=api_workers,
         )
 
-        # Check if prediction matches — use classification reward threshold
-        is_correct = result.confidence >= 0.8
-        if is_correct:
-            correct += 1
-            per_class_correct[label] += 1
-        per_class_total[label] += 1
+        for j, result in enumerate(batch_results):
+            label = labels_batch[j]
+            is_correct = result.confidence >= 0.8
+            if is_correct:
+                correct += 1
+                per_class_correct[label] += 1
+            per_class_total[label] += 1
 
-        # Track predicted label for precision calculation
-        # Map the predicted description back to the short label name
-        pred_label = _description_to_label(result.activity, dataset)
-        per_class_predicted[pred_label] += 1
-        total += 1
+            pred_label = _description_to_label(result.activity, dataset)
+            per_class_predicted[pred_label] += 1
+            total += 1
 
-        results.append({
-            "label": label,
-            "ground_truth": description,
-            "predicted": result.activity,
-            "pred_label": pred_label,
-            "reward": result.confidence,
-            "symbolic": result.symbolic_text[:100],
-            "correct": is_correct,
-        })
+            results.append({
+                "label": label,
+                "ground_truth": gt_batch[j],
+                "predicted": result.activity,
+                "pred_label": pred_label,
+                "reward": result.confidence,
+                "symbolic": result.symbolic_text[:100],
+                "correct": is_correct,
+            })
 
-        if verbose and (i + 1) % 20 == 0:
+        if verbose and batch_end % (eval_batch_size * 4) < eval_batch_size:
             running_f1 = _compute_macro_f1(
                 per_class_correct, per_class_total, per_class_predicted)
-            print(f"  [{i+1}/{n}] Running macro-F1: {running_f1:.3f}")
-
-        # Rate limit for OpenAI
-        time.sleep(0.1)
+            print(f"  [{batch_end}/{n}] Running macro-F1: {running_f1:.3f}")
 
     # Summary
     accuracy = correct / max(total, 1)
@@ -224,17 +225,17 @@ def rl_train_epoch(
     batch_size: int = 16,
     class_weights: Optional[Dict] = None,
     train_fraction: float = 1.0,
+    api_workers: int = 8,
 ) -> Dict:
     """
-    One epoch of RL training on the dataset.
+    One epoch of RL training with **parallel OpenAI API calls**.
 
-    Uses **class-balanced sampling** to prevent mode collapse:
-      - Each class gets equal representation per epoch
-      - Minority classes are oversampled, majority undersampled
-      - Class weights scale rewards (higher for rare classes)
+    Uses class-balanced sampling + batched translate for speed:
+      1. Collect a micro-batch of samples
+      2. Tokenize + generate symbolic text (serial, fast)
+      3. Fire all OpenAI classify calls in parallel (ThreadPoolExecutor)
+      4. Collect rewards, add to PPO buffer, do PPO update
     """
-    # Class-balanced sampling: equal samples per class
-    # If fraction < 1.0, reduce n_per_class proportionally
     from collections import Counter
     class_counts = Counter(dataset.y.tolist())
     max_class_size = max(class_counts.values())
@@ -248,44 +249,57 @@ def rl_train_epoch(
     rewards_list = []
     correct_count = 0
 
+    # Process in micro-batches of batch_size for parallel API calls
+    api_batch_size = batch_size  # matches PPO batch size
+
     print(f"\n[RL Epoch {epoch+1}] Training on {n} class-balanced samples "
-          f"(entropy_coef={pipeline.rl_trainer.current_entropy_coef:.4f}, "
+          f"(workers={api_workers}, "
+          f"entropy={pipeline.rl_trainer.current_entropy_coef:.4f}, "
           f"lr={pipeline.rl_trainer.optimizer.param_groups[0]['lr']:.6f})...")
 
-    for step, idx in enumerate(balanced_indices):
-        imu_data, description, label = dataset.get_sample(idx)
-        label_int = int(dataset.y[idx])
-        cw = class_weights.get(label_int, 1.0) if class_weights else 1.0
+    for batch_start in range(0, n, api_batch_size):
+        batch_end = min(batch_start + api_batch_size, n)
+        batch_indices = balanced_indices[batch_start:batch_end]
 
-        # Translate with training enabled
-        result = pipeline.translate(
-            imu_data,
-            ground_truth=description,
-            use_memory=True,
+        # Gather batch data
+        imu_batch = []
+        gt_batch = []
+        cw_batch = []
+        for idx in batch_indices:
+            imu_data, description, label = dataset.get_sample(idx)
+            label_int = int(dataset.y[idx])
+            cw = class_weights.get(label_int, 1.0) if class_weights else 1.0
+            imu_batch.append(imu_data)
+            gt_batch.append(description)
+            cw_batch.append(cw)
+
+        # Batched translate with parallel API calls
+        results = pipeline.translate_batch(
+            imu_batch,
+            ground_truths=gt_batch,
             train=True,
-            temperature=max(0.5, 1.0 - epoch * 0.05),  # slow temperature decay
-            class_weight=cw,
+            temperature=max(0.5, 1.0 - epoch * 0.05),
+            class_weights=cw_batch,
+            max_workers=api_workers,
         )
 
-        total_reward += result.confidence
-        rewards_list.append(result.confidence)
-        if result.confidence >= 0.8:
-            correct_count += 1
-        num_samples += 1
+        for r in results:
+            total_reward += r.confidence
+            rewards_list.append(r.confidence)
+            if r.confidence >= 0.8:
+                correct_count += 1
+            num_samples += 1
 
-        # PPO update when buffer is full
+        # PPO update after each micro-batch
         if len(pipeline.rl_trainer.buffer) >= batch_size:
             metrics = pipeline.rl_train_step()
             if metrics:
                 num_updates += 1
                 if num_updates % max(1, (n // batch_size) // 8) == 0:
-                    print(f"  [Sample {step+1}/{n}] PPO #{num_updates}: "
+                    print(f"  [Sample {batch_end}/{n}] PPO #{num_updates}: "
                           f"loss={metrics['loss']:.4f}, "
                           f"reward={metrics['mean_reward']:.3f}, "
                           f"lr={metrics.get('lr', 0):.6f}")
-
-        # Rate limit for OpenAI API
-        time.sleep(0.08)
 
     # Final PPO update with remaining buffer
     if len(pipeline.rl_trainer.buffer) >= 4:
