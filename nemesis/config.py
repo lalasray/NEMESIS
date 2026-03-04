@@ -102,4 +102,4 @@ class LearnerConfig:
     # Weight on prototype similarity in retrieval reranking
     prototype_beta: float = 0.2
     # Number of learning epochs (passes over training data)
-    learn_epochs: int = 2
+    learn_epochs: int = 100

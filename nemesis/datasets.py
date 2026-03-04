@@ -19,6 +19,8 @@ import urllib.request
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
+from scipy.signal import resample_poly
+from math import gcd
 
 from nemesis.config import PROJECT_ROOT
 
@@ -154,6 +156,157 @@ OPP_CHANNEL_NAMES = [
 
 
 # ============================================================================
+# IMU Resampling
+# ============================================================================
+
+def resample_imu(data: np.ndarray, orig_rate: int, target_rate: int) -> np.ndarray:
+    """
+    Resample a single IMU segment from orig_rate to target_rate Hz.
+
+    Uses polyphase rational resampling (scipy.signal.resample_poly)
+    which avoids aliasing and handles arbitrary rate ratios.
+
+    Args:
+        data:        (T, C) array of IMU channels
+        orig_rate:   source sampling rate in Hz
+        target_rate: desired sampling rate in Hz
+
+    Returns:
+        (T', C) resampled array where T' ≈ T * target_rate / orig_rate
+    """
+    if orig_rate == target_rate:
+        return data
+    g = gcd(orig_rate, target_rate)
+    up = target_rate // g
+    down = orig_rate // g
+    return resample_poly(data, up, down, axis=0).astype(np.float32)
+
+
+def resample_dataset(dataset: "HARDataset", target_rate: int) -> "HARDataset":
+    """
+    Resample all IMU data in a HARDataset to target_rate Hz.
+
+    Works for both fixed-length and variable-length datasets.
+    Updates sampling_rate metadata accordingly.
+    """
+    if dataset.sampling_rate == target_rate:
+        return dataset
+
+    orig_rate = dataset.sampling_rate
+    print(f"  [Resample] {dataset.dataset_name}/{dataset.split}: "
+          f"{orig_rate}Hz → {target_rate}Hz")
+
+    if dataset.is_variable_length:
+        X_new = [
+            resample_imu(seg, orig_rate, target_rate)
+            for seg in dataset.X
+        ]
+    else:
+        # Fixed-length: resample each sample
+        X_new = np.stack([
+            resample_imu(dataset.X[i], orig_rate, target_rate)
+            for i in range(len(dataset))
+        ]).astype(np.float32)
+
+    return HARDataset(
+        X=X_new,
+        y=dataset.y,
+        descriptions=dataset.descriptions,
+        labels=dataset.labels,
+        dataset_name=dataset.dataset_name,
+        split=dataset.split,
+        num_classes=dataset.num_classes,
+        sampling_rate=target_rate,
+        channels=dataset.channels,
+    )
+
+
+# ============================================================================
+# Multi-Dataset Merging
+# ============================================================================
+
+def merge_datasets(datasets: List["HARDataset"], target_rate: int = 30) -> "HARDataset":
+    """
+    Merge multiple HARDatasets into a single unified dataset.
+
+    All datasets are resampled to target_rate Hz first.  Labels are
+    prefixed with the source dataset name so they remain distinguishable
+    (e.g. "WALK" → "opportunity:WALK", "WALKING" → "uci_har:WALKING").
+    Integer labels (y) are remapped to a contiguous global space.
+
+    Channels are unified to 6 (acc_xyz + gyro_xyz) — datasets with fewer
+    channels are zero-padded.
+
+    Args:
+        datasets:    list of HARDataset objects (any split)
+        target_rate: common sampling rate in Hz
+
+    Returns:
+        Merged HARDataset (always variable-length since different datasets
+        may have different segment lengths).
+    """
+    print(f"\n--- Merging {len(datasets)} datasets at {target_rate}Hz ---")
+
+    all_X: List[np.ndarray] = []
+    all_descriptions: List[str] = []
+    all_labels: List[str] = []
+    all_dataset_tags: List[str] = []  # track origin
+    target_channels = 6
+
+    for ds in datasets:
+        # Resample if needed
+        ds_r = resample_dataset(ds, target_rate)
+
+        for i in range(len(ds_r)):
+            seg = ds_r.X[i] if ds_r.is_variable_length else ds_r.X[i]
+
+            # Pad to 6 channels if fewer
+            if seg.shape[-1] < target_channels:
+                pad = np.zeros(
+                    (seg.shape[0], target_channels - seg.shape[-1]),
+                    dtype=np.float32,
+                )
+                seg = np.concatenate([seg, pad], axis=-1)
+            elif seg.shape[-1] > target_channels:
+                seg = seg[:, :target_channels]
+
+            all_X.append(seg)
+            all_descriptions.append(ds_r.descriptions[i])
+            # Prefix label with dataset name for disambiguation
+            all_labels.append(f"{ds_r.dataset_name}:{ds_r.labels[i]}")
+            all_dataset_tags.append(ds_r.dataset_name)
+
+    # Build contiguous integer labels
+    unique_labels = sorted(set(all_labels))
+    label_to_int = {l: i for i, l in enumerate(unique_labels)}
+    y = np.array([label_to_int[l] for l in all_labels], dtype=int)
+
+    # Merge dataset names
+    ds_names = "+".join(sorted(set(d.dataset_name for d in datasets)))
+    split = datasets[0].split if all(d.split == datasets[0].split for d in datasets) else "mixed"
+
+    merged = HARDataset(
+        X=all_X,
+        y=y,
+        descriptions=all_descriptions,
+        labels=all_labels,
+        dataset_name=ds_names,
+        split=split,
+        num_classes=len(unique_labels),
+        sampling_rate=target_rate,
+        channels=["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"],
+    )
+
+    print(f"  Merged: {len(merged)} samples, {merged.num_classes} classes, "
+          f"{target_rate}Hz, 6ch")
+    for tag in sorted(set(all_dataset_tags)):
+        count = all_dataset_tags.count(tag)
+        print(f"    {tag}: {count} samples")
+
+    return merged
+
+
+# ============================================================================
 # Data Container
 # ============================================================================
 
@@ -211,6 +364,10 @@ class HARDataset:
         )
 
     def get_sample(self, idx: int) -> Tuple[np.ndarray, str, str]:
+        """Get a single (imu_data, description, label) tuple."""
+        return self.X[idx], self.descriptions[idx], self.labels[idx]
+
+    def __getitem__(self, idx: int) -> Tuple[np.ndarray, str, str]:
         """Get a single (imu_data, description, label) tuple."""
         return self.X[idx], self.descriptions[idx], self.labels[idx]
 
@@ -450,7 +607,7 @@ def load_uci_har(
 # WISDM Dataset Loader
 # ============================================================================
 
-WISDM_URL = "https://www.cis.fordham.edu/wisdm/includes/datasets/latest/WISDM_ar_v1.1_raw.txt"
+WISDM_URL = "https://raw.githubusercontent.com/jfuerth/hadoop-streaming/master/src/test/resources/WISDM_ar_v1.1_raw.txt"
 
 
 def download_wisdm(data_dir: str = None) -> str:
@@ -855,6 +1012,673 @@ def load_from_numpy(
 
 
 # ============================================================================
+# PAMAP2 Dataset Loader (Physical Activity Monitoring)
+# ============================================================================
+# 100Hz, 9 subjects, chest IMU acc+gyro = 6ch, 12+ activities
+# Columns: timestamp, activityID, HR, [hand IMU 17cols], [chest IMU 17cols], [ankle IMU 17cols]
+# Chest acc(6g): cols 21-23, chest gyro: cols 24-26
+
+PAMAP2_URL = "https://archive.ics.uci.edu/static/public/231/pamap2+physical+activity+monitoring.zip"
+
+PAMAP2_ACTIVITY_MAP = {
+    1: "LYING", 2: "SITTING", 3: "STANDING", 4: "WALKING",
+    5: "RUNNING", 6: "CYCLING", 7: "NORDIC_WALKING",
+    12: "ASCENDING_STAIRS", 13: "DESCENDING_STAIRS",
+    16: "VACUUM_CLEANING", 17: "IRONING", 24: "ROPE_JUMPING",
+}
+
+PAMAP2_DESCRIPTIONS = {
+    1: "The person is lying down in a resting position with minimal body movement.",
+    2: "The person is sitting still in a relaxed posture, trunk stable.",
+    3: "The person is standing upright without locomotion, small postural sway.",
+    4: "The person is walking at a normal pace with rhythmic gait pattern.",
+    5: "The person is running with vigorous bouncing, high-frequency impacts.",
+    6: "The person is cycling with periodic leg rotation and relatively stable upper body.",
+    7: "The person is Nordic walking with exaggerated arm swings and walking poles.",
+    12: "The person is ascending stairs, stepping upward with increased vertical acceleration.",
+    13: "The person is descending stairs, stepping downward with controlled deceleration.",
+    16: "The person is vacuum cleaning with irregular arm/torso movements.",
+    17: "The person is ironing with repetitive arm sliding on a flat surface.",
+    24: "The person is jumping rope with rhythmic vertical bouncing.",
+}
+
+PAMAP2_CHEST_ACC_COLS = [24, 25, 26]   # chest acc 6g (x,y,z)
+PAMAP2_CHEST_GYRO_COLS = [27, 28, 29]  # chest gyro (x,y,z)
+PAMAP2_ACTIVITY_COL = 1
+PAMAP2_TRAIN_SUBJECTS = [1, 2, 3, 4, 5, 6, 7]
+PAMAP2_TEST_SUBJECTS = [8, 9]
+
+
+def download_pamap2(data_dir: str = None) -> str:
+    if data_dir is None:
+        data_dir = os.path.join(DATASETS_DIR, "pamap2")
+    os.makedirs(data_dir, exist_ok=True)
+
+    # Look for Protocol dir specifically
+    protocol_path = None
+    for root, dirs, files in os.walk(data_dir):
+        if os.path.basename(root) == "Protocol" and any(
+            f.startswith("subject10") and f.endswith(".dat") for f in files
+        ):
+            print(f"[Dataset] PAMAP2 already exists at {root}")
+            return root
+        # Fallback: any dir with .dat files
+        if protocol_path is None and any(
+            f.startswith("subject10") and f.endswith(".dat") for f in files
+        ):
+            protocol_path = root
+    if protocol_path is not None:
+        print(f"[Dataset] PAMAP2 already exists at {protocol_path}")
+        return protocol_path
+
+    zip_path = os.path.join(data_dir, "pamap2.zip")
+    if not os.path.exists(zip_path):
+        print("[Dataset] Downloading PAMAP2 dataset (~600 MB)...")
+        urllib.request.urlretrieve(PAMAP2_URL, zip_path)
+
+    print("[Dataset] Extracting PAMAP2...")
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(data_dir)
+
+    # The outer zip may contain an inner PAMAP2_Dataset.zip
+    inner_zip = os.path.join(data_dir, "PAMAP2_Dataset.zip")
+    if os.path.exists(inner_zip):
+        print("[Dataset] Extracting inner PAMAP2_Dataset.zip...")
+        with zipfile.ZipFile(inner_zip, "r") as z2:
+            z2.extractall(data_dir)
+
+    protocol_path = None
+    for root, dirs, files in os.walk(data_dir):
+        if os.path.basename(root) == "Protocol" and any(
+            f.startswith("subject10") and f.endswith(".dat") for f in files
+        ):
+            return root
+        if protocol_path is None and any(
+            f.startswith("subject10") and f.endswith(".dat") for f in files
+        ):
+            protocol_path = root
+    if protocol_path is not None:
+        return protocol_path
+    raise RuntimeError("PAMAP2: could not find subject .dat files after extraction")
+
+
+def load_pamap2(
+    split: str = "train",
+    window_size: int = 256,
+    overlap: int = 128,
+    data_dir: str = None,
+) -> HARDataset:
+    protocol_dir = download_pamap2(data_dir)
+    subjects = PAMAP2_TRAIN_SUBJECTS if split == "train" else PAMAP2_TEST_SUBJECTS
+    imu_cols = PAMAP2_CHEST_ACC_COLS + PAMAP2_CHEST_GYRO_COLS
+
+    all_X, all_y, all_desc, all_labels = [], [], [], []
+    step = window_size - overlap
+
+    for subj in subjects:
+        fpath = os.path.join(protocol_dir, f"subject10{subj}.dat")
+        if not os.path.exists(fpath):
+            print(f"[Dataset] PAMAP2: subject10{subj}.dat not found, skipping")
+            continue
+        # Use pandas for fast reading of space-separated with NaN
+        try:
+            import pandas as pd
+            df = pd.read_csv(fpath, sep=r"\s+", header=None, dtype=np.float64,
+                             na_values=["NaN", "nan"])
+            raw = df.values
+        except ImportError:
+            raw = np.genfromtxt(fpath, dtype=np.float64)
+        activities = raw[:, PAMAP2_ACTIVITY_COL].astype(int)
+        imu = raw[:, imu_cols].astype(np.float32)
+        # Replace NaN
+        for ch in range(imu.shape[1]):
+            nans = np.isnan(imu[:, ch])
+            if nans.any():
+                valid = ~nans
+                if valid.any():
+                    imu[nans, ch] = np.interp(
+                        np.where(nans)[0], np.where(valid)[0], imu[valid, ch]
+                    )
+                else:
+                    imu[:, ch] = 0.0
+
+        for lbl in PAMAP2_ACTIVITY_MAP:
+            mask = activities == lbl
+            indices = np.where(mask)[0]
+            if len(indices) < window_size:
+                continue
+            # Find contiguous runs
+            splits = np.where(np.diff(indices) > 1)[0] + 1
+            for run in np.split(indices, splits):
+                if len(run) < window_size:
+                    continue
+                seg = imu[run]
+                for start in range(0, len(seg) - window_size + 1, step):
+                    window = seg[start:start + window_size]
+                    all_X.append(window)
+                    all_y.append(lbl)
+                    all_desc.append(PAMAP2_DESCRIPTIONS[lbl])
+                    all_labels.append(PAMAP2_ACTIVITY_MAP[lbl])
+
+    if not all_X:
+        raise RuntimeError(f"PAMAP2: no valid windows for split={split}")
+
+    label_set = sorted(set(all_y))
+    label_remap = {v: i for i, v in enumerate(label_set)}
+    y = np.array([label_remap[l] for l in all_y], dtype=int)
+
+    print(f"[Dataset] PAMAP2/{split}: {len(all_X)} windows, {len(label_set)} classes")
+    return HARDataset(
+        X=np.stack(all_X).astype(np.float32),
+        y=y, descriptions=all_desc, labels=all_labels,
+        dataset_name="PAMAP2", split=split,
+        num_classes=len(label_set), sampling_rate=100,
+        channels=["chest_acc_x", "chest_acc_y", "chest_acc_z",
+                  "chest_gyro_x", "chest_gyro_y", "chest_gyro_z"],
+    )
+
+
+# ============================================================================
+# MHEALTH Dataset Loader
+# ============================================================================
+# 50Hz, 10 subjects, right-arm acc+gyro = 6ch, 12 activities
+# Columns: chest_acc(3), ECG(2), l_ankle_acc(3), l_ankle_gyro(3), l_ankle_mag(3),
+#           r_arm_acc(3), r_arm_gyro(3), r_arm_mag(3), label
+
+MHEALTH_URL = "https://archive.ics.uci.edu/static/public/319/mhealth+dataset.zip"
+
+MHEALTH_ACTIVITY_MAP = {
+    1: "STANDING", 2: "SITTING", 3: "LYING", 4: "WALKING",
+    5: "CLIMBING_STAIRS", 6: "WAIST_BENDS", 7: "FRONTAL_ARM_ELEVATION",
+    8: "KNEE_BENDS", 9: "CYCLING", 10: "JOGGING", 11: "RUNNING",
+    12: "JUMP_FRONT_BACK",
+}
+
+MHEALTH_DESCRIPTIONS = {
+    1: "The person is standing still with minimal body movement.",
+    2: "The person is sitting in a relaxed position on a chair.",
+    3: "The person is lying down in a resting position.",
+    4: "The person is walking at a normal steady pace.",
+    5: "The person is climbing stairs, stepping upward repeatedly.",
+    6: "The person is doing waist bends, flexing the torso forward and back.",
+    7: "The person is raising their arms in front (frontal elevation) repeatedly.",
+    8: "The person is bending their knees (squatting) repeatedly.",
+    9: "The person is cycling on an exercise bike with periodic leg rotation.",
+    10: "The person is jogging at a moderate pace with bouncing movements.",
+    11: "The person is running at a vigorous pace with high-frequency impacts.",
+    12: "The person is jumping forward and backward in a rhythmic pattern.",
+}
+
+MHEALTH_ARM_ACC_COLS = [14, 15, 16]   # right-arm acc
+MHEALTH_ARM_GYRO_COLS = [17, 18, 19]  # right-arm gyro
+MHEALTH_LABEL_COL = 23
+MHEALTH_TRAIN_SUBJECTS = list(range(1, 9))   # 1-8
+MHEALTH_TEST_SUBJECTS = [9, 10]
+
+
+def download_mhealth(data_dir: str = None) -> str:
+    if data_dir is None:
+        data_dir = os.path.join(DATASETS_DIR, "mhealth")
+    os.makedirs(data_dir, exist_ok=True)
+
+    for root, dirs, files in os.walk(data_dir):
+        if any(f.startswith("mHealth_subject") and f.endswith(".log") for f in files):
+            print(f"[Dataset] MHEALTH already exists at {root}")
+            return root
+
+    zip_path = os.path.join(data_dir, "mhealth.zip")
+    if not os.path.exists(zip_path):
+        print("[Dataset] Downloading MHEALTH dataset...")
+        urllib.request.urlretrieve(MHEALTH_URL, zip_path)
+
+    print("[Dataset] Extracting MHEALTH...")
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(data_dir)
+
+    for root, dirs, files in os.walk(data_dir):
+        if any(f.startswith("mHealth_subject") and f.endswith(".log") for f in files):
+            return root
+    raise RuntimeError("MHEALTH: .log files not found after extraction")
+
+
+def load_mhealth(
+    split: str = "train",
+    window_size: int = 128,
+    overlap: int = 64,
+    data_dir: str = None,
+) -> HARDataset:
+    log_dir = download_mhealth(data_dir)
+    subjects = MHEALTH_TRAIN_SUBJECTS if split == "train" else MHEALTH_TEST_SUBJECTS
+    imu_cols = MHEALTH_ARM_ACC_COLS + MHEALTH_ARM_GYRO_COLS
+
+    all_X, all_y, all_desc, all_labels = [], [], [], []
+    step = window_size - overlap
+
+    for subj in subjects:
+        fpath = os.path.join(log_dir, f"mHealth_subject{subj}.log")
+        if not os.path.exists(fpath):
+            continue
+        raw = np.loadtxt(fpath)
+        labels = raw[:, MHEALTH_LABEL_COL].astype(int)
+        imu = raw[:, imu_cols].astype(np.float32)
+
+        for lbl in MHEALTH_ACTIVITY_MAP:
+            mask = labels == lbl
+            indices = np.where(mask)[0]
+            if len(indices) < window_size:
+                continue
+            splits = np.where(np.diff(indices) > 1)[0] + 1
+            for run in np.split(indices, splits):
+                if len(run) < window_size:
+                    continue
+                seg = imu[run]
+                for start in range(0, len(seg) - window_size + 1, step):
+                    w = seg[start:start + window_size]
+                    all_X.append(w)
+                    all_y.append(lbl)
+                    all_desc.append(MHEALTH_DESCRIPTIONS[lbl])
+                    all_labels.append(MHEALTH_ACTIVITY_MAP[lbl])
+
+    if not all_X:
+        raise RuntimeError(f"MHEALTH: no valid windows for split={split}")
+
+    label_set = sorted(set(all_y))
+    label_remap = {v: i for i, v in enumerate(label_set)}
+    y = np.array([label_remap[l] for l in all_y], dtype=int)
+
+    print(f"[Dataset] MHEALTH/{split}: {len(all_X)} windows, {len(label_set)} classes")
+    return HARDataset(
+        X=np.stack(all_X).astype(np.float32), y=y,
+        descriptions=all_desc, labels=all_labels,
+        dataset_name="MHEALTH", split=split,
+        num_classes=len(label_set), sampling_rate=50,
+        channels=["rarm_acc_x", "rarm_acc_y", "rarm_acc_z",
+                  "rarm_gyro_x", "rarm_gyro_y", "rarm_gyro_z"],
+    )
+
+
+# ============================================================================
+# Daphnet Freezing of Gait Dataset
+# ============================================================================
+# 64Hz, 10 subjects, trunk acc only (3ch, pad gyro → 6ch), 2 classes
+# Columns: timestamp, ankle(3), upper_leg(3), trunk(3), annotation
+
+DAPHNET_URL = "https://archive.ics.uci.edu/static/public/245/daphnet+freezing+of+gait.zip"
+
+DAPHNET_ACTIVITY_MAP = {1: "NORMAL_GAIT", 2: "FREEZE_OF_GAIT"}
+DAPHNET_DESCRIPTIONS = {
+    1: "The person is walking normally with regular gait pattern, no freezing episodes.",
+    2: "The person is experiencing a freezing of gait episode, unable to move forward despite the intention to walk.",
+}
+DAPHNET_TRUNK_COLS = [7, 8, 9]  # trunk horizontal, vertical, lateral
+DAPHNET_ANNOTATION_COL = 10
+DAPHNET_TRAIN_SUBJECTS = ["S01", "S02", "S03", "S04", "S05", "S06", "S07"]
+DAPHNET_TEST_SUBJECTS = ["S08", "S09", "S10"]
+
+
+def download_daphnet(data_dir: str = None) -> str:
+    if data_dir is None:
+        data_dir = os.path.join(DATASETS_DIR, "daphnet")
+    os.makedirs(data_dir, exist_ok=True)
+
+    for root, dirs, files in os.walk(data_dir):
+        if any(f.endswith(".txt") and f.startswith("S") for f in files):
+            print(f"[Dataset] Daphnet already exists at {root}")
+            return root
+
+    zip_path = os.path.join(data_dir, "daphnet.zip")
+    if not os.path.exists(zip_path):
+        print("[Dataset] Downloading Daphnet dataset...")
+        urllib.request.urlretrieve(DAPHNET_URL, zip_path)
+
+    print("[Dataset] Extracting Daphnet...")
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(data_dir)
+
+    for root, dirs, files in os.walk(data_dir):
+        if any(f.endswith(".txt") and f.startswith("S") for f in files):
+            return root
+    raise RuntimeError("Daphnet: .txt files not found after extraction")
+
+
+def load_daphnet(
+    split: str = "train",
+    window_size: int = 192,
+    overlap: int = 96,
+    data_dir: str = None,
+) -> HARDataset:
+    dataset_dir = download_daphnet(data_dir)
+    subjects = DAPHNET_TRAIN_SUBJECTS if split == "train" else DAPHNET_TEST_SUBJECTS
+
+    all_X, all_y, all_desc, all_labels = [], [], [], []
+    step = window_size - overlap
+
+    for subj in subjects:
+        # Each subject may have R01, R02 runs
+        for run in ["R01", "R02"]:
+            fpath = os.path.join(dataset_dir, f"{subj}{run}.txt")
+            if not os.path.exists(fpath):
+                continue
+            try:
+                raw = np.loadtxt(fpath, dtype=np.float64)
+            except Exception:
+                continue
+            if raw.shape[1] < 11:
+                continue
+            trunk = raw[:, DAPHNET_TRUNK_COLS].astype(np.float32)
+            # Pad with zeros for gyro (only has accelerometer)
+            gyro_pad = np.zeros_like(trunk)
+            imu = np.concatenate([trunk, gyro_pad], axis=-1)  # (T, 6)
+            annotations = raw[:, DAPHNET_ANNOTATION_COL].astype(int)
+
+            for lbl in DAPHNET_ACTIVITY_MAP:
+                mask = annotations == lbl
+                indices = np.where(mask)[0]
+                if len(indices) < window_size:
+                    continue
+                splits_arr = np.where(np.diff(indices) > 1)[0] + 1
+                for run_idx in np.split(indices, splits_arr):
+                    if len(run_idx) < window_size:
+                        continue
+                    seg = imu[run_idx]
+                    for start in range(0, len(seg) - window_size + 1, step):
+                        w = seg[start:start + window_size]
+                        all_X.append(w)
+                        all_y.append(lbl)
+                        all_desc.append(DAPHNET_DESCRIPTIONS[lbl])
+                        all_labels.append(DAPHNET_ACTIVITY_MAP[lbl])
+
+    if not all_X:
+        raise RuntimeError(f"Daphnet: no valid windows for split={split}")
+
+    label_set = sorted(set(all_y))
+    label_remap = {v: i for i, v in enumerate(label_set)}
+    y = np.array([label_remap[l] for l in all_y], dtype=int)
+
+    print(f"[Dataset] Daphnet/{split}: {len(all_X)} windows, {len(label_set)} classes")
+    return HARDataset(
+        X=np.stack(all_X).astype(np.float32), y=y,
+        descriptions=all_desc, labels=all_labels,
+        dataset_name="Daphnet", split=split,
+        num_classes=len(label_set), sampling_rate=64,
+        channels=["trunk_acc_h", "trunk_acc_v", "trunk_acc_l",
+                  "gyro_pad_x", "gyro_pad_y", "gyro_pad_z"],
+    )
+
+
+# ============================================================================
+# DSA — Daily and Sports Activities Dataset
+# ============================================================================
+# 25Hz, 8 subjects, torso acc+gyro = 6ch, 19 activities
+# Structure: a{01-19}/p{1-8}/s{01-60}.txt  (125 rows × 45 cols)
+# 5 sensors × 9 axes: torso(0-8), R arm(9-17), L arm(18-26), R leg(27-35), L leg(36-44)
+
+DSA_URL = "https://archive.ics.uci.edu/static/public/256/daily+and+sports+activities.zip"
+
+DSA_ACTIVITY_MAP = {
+    1: "SITTING", 2: "STANDING", 3: "LYING_BACK", 4: "LYING_RIGHT",
+    5: "ASCENDING_STAIRS", 6: "DESCENDING_STAIRS",
+    7: "STANDING_IN_ELEVATOR", 8: "MOVING_IN_ELEVATOR",
+    9: "WALKING_PARKING", 10: "WALKING_TREADMILL_FLAT",
+    11: "WALKING_TREADMILL_INCLINE", 12: "RUNNING_TREADMILL",
+    13: "STEPPER", 14: "CROSS_TRAINER", 15: "CYCLING_HORIZONTAL",
+    16: "CYCLING_VERTICAL", 17: "ROWING", 18: "JUMPING", 19: "BASKETBALL",
+}
+
+DSA_DESCRIPTIONS = {
+    1: "The person is sitting still in a chair with minimal body movement.",
+    2: "The person is standing upright without locomotion.",
+    3: "The person is lying on their back in a resting position.",
+    4: "The person is lying on their right side.",
+    5: "The person is ascending stairs, stepping upward.",
+    6: "The person is descending stairs, stepping downward.",
+    7: "The person is standing still inside an elevator.",
+    8: "The person is in a moving elevator (standing while it moves).",
+    9: "The person is walking in a parking lot at a normal pace.",
+    10: "The person is walking on a flat treadmill at about 4 km/h.",
+    11: "The person is walking on an inclined treadmill at about 4 km/h.",
+    12: "The person is running on a treadmill at about 8 km/h.",
+    13: "The person is exercising on a stepper machine with rhythmic stepping.",
+    14: "The person is exercising on a cross-trainer with elliptical arm/leg motion.",
+    15: "The person is cycling on a horizontal exercise bike.",
+    16: "The person is cycling on a vertical exercise bike.",
+    17: "The person is rowing on a rowing machine with periodic pull strokes.",
+    18: "The person is jumping repeatedly in place.",
+    19: "The person is playing basketball with varied movements.",
+}
+
+DSA_TORSO_ACC_COLS = [0, 1, 2]
+DSA_TORSO_GYRO_COLS = [3, 4, 5]
+DSA_TRAIN_SUBJECTS = [1, 2, 3, 4, 5, 6]
+DSA_TEST_SUBJECTS = [7, 8]
+
+
+def download_dsa(data_dir: str = None) -> str:
+    if data_dir is None:
+        data_dir = os.path.join(DATASETS_DIR, "dsa")
+    os.makedirs(data_dir, exist_ok=True)
+
+    # Look for the data/ dir structure
+    for root, dirs, files in os.walk(data_dir):
+        if "a01" in dirs or "a19" in [d for d in dirs]:
+            print(f"[Dataset] DSA already exists at {root}")
+            return root
+
+    zip_path = os.path.join(data_dir, "dsa.zip")
+    if not os.path.exists(zip_path):
+        print("[Dataset] Downloading DSA dataset...")
+        urllib.request.urlretrieve(DSA_URL, zip_path)
+
+    print("[Dataset] Extracting DSA...")
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(data_dir)
+
+    for root, dirs, files in os.walk(data_dir):
+        if "a01" in dirs:
+            return root
+    raise RuntimeError("DSA: activity folders not found after extraction")
+
+
+def load_dsa(
+    split: str = "train",
+    data_dir: str = None,
+) -> HARDataset:
+    base_dir = download_dsa(data_dir)
+    subjects = DSA_TRAIN_SUBJECTS if split == "train" else DSA_TEST_SUBJECTS
+    imu_cols = DSA_TORSO_ACC_COLS + DSA_TORSO_GYRO_COLS
+
+    all_X, all_y, all_desc, all_labels = [], [], [], []
+
+    for act_id in DSA_ACTIVITY_MAP:
+        act_dir = os.path.join(base_dir, f"a{act_id:02d}")
+        if not os.path.isdir(act_dir):
+            continue
+        for subj in subjects:
+            subj_dir = os.path.join(act_dir, f"p{subj}")
+            if not os.path.isdir(subj_dir):
+                continue
+            for seg_id in range(1, 61):
+                fpath = os.path.join(subj_dir, f"s{seg_id:02d}.txt")
+                if not os.path.exists(fpath):
+                    continue
+                try:
+                    raw = np.loadtxt(fpath, delimiter=",")
+                except Exception:
+                    continue
+                if raw.shape[0] < 50 or raw.shape[1] < 6:
+                    continue
+                imu = raw[:, imu_cols].astype(np.float32)
+                all_X.append(imu)
+                all_y.append(act_id)
+                all_desc.append(DSA_DESCRIPTIONS[act_id])
+                all_labels.append(DSA_ACTIVITY_MAP[act_id])
+
+    if not all_X:
+        raise RuntimeError(f"DSA: no valid segments for split={split}")
+
+    label_set = sorted(set(all_y))
+    label_remap = {v: i for i, v in enumerate(label_set)}
+    y = np.array([label_remap[l] for l in all_y], dtype=int)
+
+    # DSA is fixed-length (125 samples per segment at 25Hz = 5s)
+    X = np.stack(all_X).astype(np.float32)
+    print(f"[Dataset] DSA/{split}: {len(X)} segments, {len(label_set)} classes")
+    return HARDataset(
+        X=X, y=y, descriptions=all_desc, labels=all_labels,
+        dataset_name="DSA", split=split,
+        num_classes=len(label_set), sampling_rate=25,
+        channels=["torso_acc_x", "torso_acc_y", "torso_acc_z",
+                  "torso_gyro_x", "torso_gyro_y", "torso_gyro_z"],
+    )
+
+
+# ============================================================================
+# HAPT — Smartphone-Based Recognition of Human Activities and
+#         Postural Transitions
+# ============================================================================
+# 50Hz, 30 subjects, smartphone acc+gyro = 6ch, 12 activities
+# Raw data: acc_expNN_userNN.txt, gyro_expNN_userNN.txt
+
+HAPT_URL = "https://archive.ics.uci.edu/static/public/341/smartphone+based+recognition+of+human+activities+and+postural+transitions.zip"
+
+HAPT_ACTIVITY_MAP = {
+    1: "WALKING", 2: "WALKING_UPSTAIRS", 3: "WALKING_DOWNSTAIRS",
+    4: "SITTING", 5: "STANDING", 6: "LAYING",
+    7: "STAND_TO_SIT", 8: "SIT_TO_STAND", 9: "SIT_TO_LIE",
+    10: "LIE_TO_SIT", 11: "STAND_TO_LIE", 12: "LIE_TO_STAND",
+}
+
+HAPT_DESCRIPTIONS = {
+    1: "The person is walking forward at a normal pace on a flat surface.",
+    2: "The person is ascending stairs.",
+    3: "The person is descending stairs.",
+    4: "The person is sitting still on a chair.",
+    5: "The person is standing upright without moving.",
+    6: "The person is lying down on a flat surface.",
+    7: "The person is transitioning from standing to sitting.",
+    8: "The person is transitioning from sitting to standing.",
+    9: "The person is transitioning from sitting to lying down.",
+    10: "The person is transitioning from lying to sitting.",
+    11: "The person is transitioning from standing to lying down.",
+    12: "The person is transitioning from lying to standing.",
+}
+
+HAPT_TRAIN_USERS = list(range(1, 22))   # users 1-21
+HAPT_TEST_USERS  = list(range(22, 31))  # users 22-30
+
+
+def download_hapt(data_dir: str = None) -> str:
+    if data_dir is None:
+        data_dir = os.path.join(DATASETS_DIR, "hapt")
+    os.makedirs(data_dir, exist_ok=True)
+
+    for root, dirs, files in os.walk(data_dir):
+        if "labels.txt" in files and any(f.startswith("acc_") for f in files):
+            print(f"[Dataset] HAPT already exists at {root}")
+            return root
+
+    zip_path = os.path.join(data_dir, "hapt.zip")
+    if not os.path.exists(zip_path):
+        print("[Dataset] Downloading HAPT dataset...")
+        urllib.request.urlretrieve(HAPT_URL, zip_path)
+
+    print("[Dataset] Extracting HAPT...")
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(data_dir)
+
+    for root, dirs, files in os.walk(data_dir):
+        if "labels.txt" in files and any(f.startswith("acc_") for f in files):
+            return root
+
+    # Try looking in RawData subfolder
+    for root, dirs, files in os.walk(data_dir):
+        if any(f.startswith("acc_exp") for f in files):
+            return root
+
+    raise RuntimeError("HAPT: raw data files not found after extraction")
+
+
+def load_hapt(
+    split: str = "train",
+    window_size: int = 128,
+    overlap: int = 64,
+    data_dir: str = None,
+) -> HARDataset:
+    raw_dir = download_hapt(data_dir)
+
+    # Find labels.txt (may be in parent dir)
+    labels_path = os.path.join(raw_dir, "labels.txt")
+    if not os.path.exists(labels_path):
+        parent = os.path.dirname(raw_dir)
+        labels_path = os.path.join(parent, "labels.txt")
+    if not os.path.exists(labels_path):
+        # Search for it
+        for root, dirs, files in os.walk(os.path.dirname(raw_dir)):
+            if "labels.txt" in files:
+                labels_path = os.path.join(root, "labels.txt")
+                break
+
+    # Parse labels: exp_id, user_id, activity_id, start_sample, end_sample
+    label_entries = np.loadtxt(labels_path, dtype=int)
+    target_users = set(HAPT_TRAIN_USERS if split == "train" else HAPT_TEST_USERS)
+
+    all_X, all_y, all_desc, all_labels = [], [], [], []
+
+    # Group by (exp_id, user_id)
+    exp_user_pairs = set()
+    for row in label_entries:
+        exp_id, user_id = int(row[0]), int(row[1])
+        if user_id in target_users:
+            exp_user_pairs.add((exp_id, user_id))
+
+    for exp_id, user_id in sorted(exp_user_pairs):
+        acc_path = os.path.join(raw_dir, f"acc_exp{exp_id:02d}_user{user_id:02d}.txt")
+        gyro_path = os.path.join(raw_dir, f"gyro_exp{exp_id:02d}_user{user_id:02d}.txt")
+        if not (os.path.exists(acc_path) and os.path.exists(gyro_path)):
+            continue
+
+        acc = np.loadtxt(acc_path).astype(np.float32)   # (T, 3)
+        gyro = np.loadtxt(gyro_path).astype(np.float32)  # (T, 3)
+        T = min(len(acc), len(gyro))
+        imu = np.concatenate([acc[:T], gyro[:T]], axis=1)  # (T, 6)
+
+        # Extract labeled segments
+        for row in label_entries:
+            if int(row[0]) != exp_id or int(row[1]) != user_id:
+                continue
+            act_id, start, end = int(row[2]), int(row[3]) - 1, int(row[4])
+            if act_id not in HAPT_ACTIVITY_MAP:
+                continue
+            seg = imu[start:end]
+            if len(seg) < window_size:
+                continue
+
+            step = window_size - overlap
+            for ws in range(0, len(seg) - window_size + 1, step):
+                w = seg[ws:ws + window_size]
+                all_X.append(w)
+                all_y.append(act_id)
+                all_desc.append(HAPT_DESCRIPTIONS[act_id])
+                all_labels.append(HAPT_ACTIVITY_MAP[act_id])
+
+    if not all_X:
+        raise RuntimeError(f"HAPT: no valid windows for split={split}")
+
+    label_set = sorted(set(all_y))
+    label_remap = {v: i for i, v in enumerate(label_set)}
+    y = np.array([label_remap[l] for l in all_y], dtype=int)
+
+    print(f"[Dataset] HAPT/{split}: {len(all_X)} windows, {len(label_set)} classes")
+    return HARDataset(
+        X=np.stack(all_X).astype(np.float32), y=y,
+        descriptions=all_desc, labels=all_labels,
+        dataset_name="HAPT", split=split,
+        num_classes=len(label_set), sampling_rate=50,
+        channels=["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"],
+    )
+
+
+# ============================================================================
 # Quick summary
 # ============================================================================
 
@@ -886,3 +1710,64 @@ def print_dataset_info(dataset: HARDataset):
             seen.add(label)
             print(f"    {label:25s} → \"{desc}\"")
     print()
+
+
+# ============================================================================
+# DATASET_LOADERS — central registry used by train_har.py
+# ============================================================================
+# Each entry maps a short name → dict with:
+#   load_train:    callable() -> HARDataset  (training split)
+#   load_test:     callable() -> HARDataset  (test split)
+#   imu_position:  str  (body placement for LLM context)
+#   sampling_rate: int  (native Hz)
+
+DATASET_LOADERS = {
+    "opportunity": {
+        "load_train": lambda: load_opportunity(split="train"),
+        "load_test":  lambda: load_opportunity(split="test"),
+        "imu_position": "BACK",
+        "sampling_rate": 30,
+    },
+    "uci_har": {
+        "load_train": lambda: load_uci_har(split="train"),
+        "load_test":  lambda: load_uci_har(split="test"),
+        "imu_position": "WAIST",
+        "sampling_rate": 50,
+    },
+    "wisdm": {
+        "load_train": lambda: load_wisdm(split="train"),
+        "load_test":  lambda: load_wisdm(split="test"),
+        "imu_position": "POCKET",
+        "sampling_rate": 20,
+    },
+    "pamap2": {
+        "load_train": lambda: load_pamap2(split="train"),
+        "load_test":  lambda: load_pamap2(split="test"),
+        "imu_position": "CHEST",
+        "sampling_rate": 100,
+    },
+    "mhealth": {
+        "load_train": lambda: load_mhealth(split="train"),
+        "load_test":  lambda: load_mhealth(split="test"),
+        "imu_position": "RIGHT_ARM",
+        "sampling_rate": 50,
+    },
+    "daphnet": {
+        "load_train": lambda: load_daphnet(split="train"),
+        "load_test":  lambda: load_daphnet(split="test"),
+        "imu_position": "TRUNK",
+        "sampling_rate": 64,
+    },
+    "dsa": {
+        "load_train": lambda: load_dsa(split="train"),
+        "load_test":  lambda: load_dsa(split="test"),
+        "imu_position": "TORSO",
+        "sampling_rate": 25,
+    },
+    "hapt": {
+        "load_train": lambda: load_hapt(split="train"),
+        "load_test":  lambda: load_hapt(split="test"),
+        "imu_position": "WAIST",
+        "sampling_rate": 50,
+    },
+}

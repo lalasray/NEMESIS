@@ -129,7 +129,7 @@ class NemesisPipeline:
     def pretrain_tokenizer(
         self,
         imu_data_list: List[np.ndarray],
-        num_epochs: int = 200,
+        num_epochs: int = 1000,
         batch_size: int = 256,
         lr: float = 1e-3,
         patience: int = 15,
@@ -310,6 +310,72 @@ class NemesisPipeline:
 
         return {"accuracy": acc, "correct": correct, "total": total,
                 "updates": updates, "learning_stats": stats}
+
+    def learn_loop(
+        self,
+        tokens_list: List[List[int]],
+        descriptions: List[str],
+        ground_truths: List[str],
+        num_epochs: int = 100,
+        patience: int = 10,
+        max_workers: int = 8,
+        batch_size: int = 32,
+    ) -> List[Dict]:
+        """
+        Multi-epoch learning loop with early stopping.
+
+        Runs learn_epoch repeatedly, tracking accuracy. Stops early
+        if accuracy does not improve for `patience` consecutive epochs.
+
+        Args:
+            tokens_list: Pre-tokenized training samples.
+            descriptions: Pre-computed descriptor texts.
+            ground_truths: Ground-truth activity labels.
+            num_epochs: Maximum number of learning epochs.
+            patience: Stop if no accuracy improvement for this many epochs.
+            max_workers: Parallel LLM threads.
+            batch_size: Samples per batch.
+
+        Returns:
+            List of per-epoch metric dicts.
+        """
+        print(f"\n--- Memory Learning ({num_epochs} epochs, patience={patience}) ---")
+        history = []
+        best_acc = -1.0
+        patience_counter = 0
+
+        for epoch in range(1, num_epochs + 1):
+            print(f"\n  === Learn Epoch {epoch}/{num_epochs} ===")
+            metrics = self.learn_epoch(
+                tokens_list=tokens_list,
+                descriptions=descriptions,
+                ground_truths=ground_truths,
+                max_workers=max_workers,
+                batch_size=batch_size,
+            )
+            history.append(metrics)
+            acc = metrics["accuracy"]
+
+            if acc > best_acc + 1e-4:
+                best_acc = acc
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            print(f"  [Learn] Epoch {epoch}: acc={acc:.4f}, "
+                  f"best={best_acc:.4f}, patience={patience_counter}/{patience}")
+
+            if patience_counter >= patience:
+                print(f"  [Learn] Early stopping at epoch {epoch} "
+                      f"(no improvement for {patience} epochs)")
+                break
+
+            if acc >= 0.999:
+                print(f"  [Learn] Perfect accuracy reached, stopping.")
+                break
+
+        print(f"  [Learn] Finished: {len(history)} epochs, best_acc={best_acc:.4f}")
+        return history
 
     def classify_batch(
         self,

@@ -1,456 +1,654 @@
-"""Train NEMESIS on a real HAR dataset (UCI HAR or Opportunity).
+#!/usr/bin/env python3
+"""
+train_har.py — Multi-dataset IMU activity recognition with NEMESIS.
 
-Usage:
-    # Opportunity with VQ-VAE (recommended)
-    python train_har.py --dataset opportunity --workers 8
+Supports:
+  • Training / evaluation on individual or merged datasets
+  • Leave-One-Dataset-Out (LODO) cross-validation
+  • Automatic download, resampling, and channel padding
 
-    # UCI HAR
-    python train_har.py --dataset uci_har --workers 8
+Usage examples:
+  # Single dataset
+  python train_har.py --dataset opportunity
 
-    # Quick test (100 samples)
-    python train_har.py --dataset opportunity --eval-samples 100 --workers 8
+  # All 8 datasets, merged evaluation
+  python train_har.py --dataset all
 
-Pipeline:
-    1. Download + load the HAR dataset
-    2. Pre-train VQ-VAE on raw IMU data (unsupervised)
-    3. Tokenize test samples → statistical descriptions → LLM classify
-    4. Report macro F1, per-class precision/recall/F1
+  # Leave-one-dataset-out
+  python train_har.py --dataset all --lodo
+
+  # Specific datasets
+  python train_har.py --dataset opportunity pamap2 mhealth --target-rate 30
 """
 
+import argparse
+import json
 import os
 import sys
 import time
-import argparse
-import json
-import numpy as np
-from typing import Dict, List, Optional
-from collections import defaultdict
+import traceback
 
+import numpy as np
+from collections import Counter
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    classification_report,
+    confusion_matrix,
+)
+
+# ── NEMESIS ──────────────────────────────────────────────────────────────────
 from nemesis.config import (
-    IMUTokenizerConfig, ClassifierConfig, MemoryConfig, LearnerConfig,
-    CHECKPOINTS_DIR, PROJECT_ROOT, MEMORY_DIR,
+    IMUTokenizerConfig,
+    ClassifierConfig,
+    MemoryConfig,
+    LearnerConfig,
+    CHECKPOINTS_DIR,
+    MEMORY_DIR,
 )
-from nemesis.datasets import (
-    load_uci_har, load_opportunity, print_dataset_info, HARDataset,
-)
-from nemesis.imu_tokenizer import VQVAE_Tokenizer
-from nemesis.token_descriptor import TokenDescriptor
 from nemesis.pipeline import NemesisPipeline
+from nemesis.datasets import (
+    DATASET_LOADERS,
+    HARDataset,
+    merge_datasets,
+    resample_dataset,
+    print_dataset_info,
+)
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+def load_single_dataset(name: str) -> dict:
+    """Load train+test for a single dataset. Returns dict or raises."""
+    if name not in DATASET_LOADERS:
+        raise ValueError(
+            f"Unknown dataset '{name}'. Available: {list(DATASET_LOADERS.keys())}"
+        )
+    entry = DATASET_LOADERS[name]
+    print(f"\n{'='*60}")
+    print(f"  Loading: {name}")
+    print(f"{'='*60}")
+    train_ds = entry["load_train"]()
+    test_ds = entry["load_test"]()
+    return {
+        "name": name,
+        "train": train_ds,
+        "test": test_ds,
+        "imu_position": entry["imu_position"],
+        "sampling_rate": entry["sampling_rate"],
+    }
+
+
+def resample_if_needed(ds: HARDataset, target_rate: int) -> HARDataset:
+    """Resample dataset to target_rate if rates differ."""
+    if ds.sampling_rate == target_rate:
+        return ds
+    print(f"  Resampling {ds.dataset_name}/{ds.split} "
+          f"{ds.sampling_rate}Hz → {target_rate}Hz ...")
+    return resample_dataset(ds, target_rate)
+
+
+def pad_channels(ds: HARDataset, target_channels: int = 6) -> HARDataset:
+    """Zero-pad channels if < target_channels."""
+    if ds.num_channels >= target_channels:
+        return ds
+    pad_width = target_channels - ds.num_channels
+    if ds.is_variable_length:
+        new_X = [
+            np.concatenate([x, np.zeros((x.shape[0], pad_width), dtype=np.float32)], axis=1)
+            for x in ds.X
+        ]
+    else:
+        new_X = np.concatenate(
+            [ds.X, np.zeros((*ds.X.shape[:-1], pad_width), dtype=np.float32)],
+            axis=-1,
+        )
+    ch_names = list(ds.channels) + [f"pad_{i}" for i in range(pad_width)]
+    return HARDataset(
+        X=new_X,
+        y=ds.y,
+        descriptions=ds.descriptions,
+        labels=ds.labels,
+        dataset_name=ds.dataset_name,
+        split=ds.split,
+        num_classes=ds.num_classes,
+        sampling_rate=ds.sampling_rate,
+        channels=ch_names,
+    )
 
 
 # ============================================================================
 # Evaluation
 # ============================================================================
 
-def _compute_macro_f1(
-    per_class_correct: Dict,
-    per_class_total: Dict,
-    per_class_predicted: Dict,
-) -> float:
-    """Compute macro-averaged F1 score across all classes."""
-    f1_scores = []
-    all_labels = set(per_class_total.keys()) | set(per_class_predicted.keys())
-    for label in all_labels:
-        tp = per_class_correct.get(label, 0)
-        support = per_class_total.get(label, 0)
-        predicted = per_class_predicted.get(label, 0)
-        precision = tp / max(predicted, 1)
-        recall = tp / max(support, 1)
-        if precision + recall > 0:
-            f1_scores.append(2 * precision * recall / (precision + recall))
-        else:
-            f1_scores.append(0.0)
-    return float(np.mean(f1_scores)) if f1_scores else 0.0
-
-
-def evaluate(
+def evaluate_pipeline(
     pipeline: NemesisPipeline,
-    dataset: HARDataset,
-    max_samples: int = 0,
-    verbose: bool = True,
-    api_workers: int = 8,
-) -> Dict:
+    test_ds: HARDataset,
+    batch_size: int = 32,
+    max_workers: int = 8,
+    max_samples: int = 200,
+    tag: str = "",
+) -> dict:
     """
-    Evaluate the pipeline on a test set with parallel OpenAI calls.
-
-    Primary metric: **macro F1** (handles class imbalance).
-
-    Args:
-        max_samples: 0 = use entire dataset
-        api_workers: number of parallel OpenAI API threads
+    Evaluate the pipeline on a test dataset.
+    Returns dict with accuracy, macro_f1, classification_report.
     """
-    n = min(max_samples, len(dataset)) if max_samples > 0 else len(dataset)
-    dataset = dataset.shuffle(seed=99).subset(n)
+    N = len(test_ds)
+    if N > max_samples:
+        rng = np.random.RandomState(42)
+        indices = rng.choice(N, max_samples, replace=False)
+    else:
+        indices = np.arange(N)
 
-    correct = 0
-    total = 0
-    per_class_correct = defaultdict(int)
-    per_class_total = defaultdict(int)
-    per_class_predicted = defaultdict(int)
-    results = []
+    all_preds = []
+    all_gts = []
+    all_labels = []
 
-    eval_batch_size = max(api_workers, 16)
+    for start in range(0, len(indices), batch_size):
+        batch_idx = indices[start : start + batch_size]
+        imu_batch = [test_ds[int(i)][0] for i in batch_idx]
+        gt_batch = [test_ds.labels[int(i)] for i in batch_idx]
 
-    print(f"\n[Eval] Evaluating on {n} samples (workers={api_workers})...")
-
-    for batch_start in range(0, n, eval_batch_size):
-        batch_end = min(batch_start + eval_batch_size, n)
-
-        imu_batch = []
-        gt_batch = []
-        labels_batch = []
-        for i in range(batch_start, batch_end):
-            imu_data, description, label = dataset.get_sample(i)
-            imu_batch.append(imu_data)
-            gt_batch.append(description)
-            labels_batch.append(label)
-
-        batch_results = pipeline.classify_batch(
-            imu_batch,
+        results = pipeline.classify_batch(
+            imu_batch=imu_batch,
             ground_truths=gt_batch,
-            max_workers=api_workers,
+            max_workers=max_workers,
         )
 
-        for j, result in enumerate(batch_results):
-            label = labels_batch[j]
-            is_correct = result.reward >= 0.8
-            if is_correct:
-                correct += 1
-                per_class_correct[label] += 1
-            per_class_total[label] += 1
+        for r, gt in zip(results, gt_batch):
+            all_preds.append(r.activity)
+            all_gts.append(gt)
 
-            pred_label = _description_to_label(result.activity, dataset)
-            per_class_predicted[pred_label] += 1
-            total += 1
+        done = min(start + batch_size, len(indices))
+        print(f"  [{tag}] Evaluated {done}/{len(indices)}", end="\r")
 
-            results.append({
-                "label": label,
-                "ground_truth": gt_batch[j],
-                "predicted": result.activity,
-                "pred_label": pred_label,
-                "reward": result.reward,
-                "descriptor": result.descriptor_text[:100],
-                "correct": is_correct,
-            })
+    print()
 
-        if verbose and batch_end % (eval_batch_size * 4) < eval_batch_size:
-            running_f1 = _compute_macro_f1(
-                per_class_correct, per_class_total, per_class_predicted)
-            print(f"  [{batch_end}/{n}] Running macro-F1: {running_f1:.3f}")
+    # Map to consistent label set from test_ds
+    label_set = sorted(set(all_gts))
+    accuracy = accuracy_score(all_gts, all_preds)
+    macro_f1 = f1_score(all_gts, all_preds, average="macro", zero_division=0)
 
-    # Summary
-    accuracy = correct / max(total, 1)
-    macro_f1 = _compute_macro_f1(per_class_correct, per_class_total, per_class_predicted)
-    metrics = {
-        "macro_f1": macro_f1,
+    pred_counter = Counter(all_preds)
+    gt_counter = Counter(all_gts)
+
+    result = {
+        "tag": tag,
         "accuracy": accuracy,
-        "total": total,
-        "correct": correct,
-        "per_class": {},
+        "macro_f1": macro_f1,
+        "n_samples": len(all_gts),
+        "n_classes_gt": len(label_set),
+        "n_classes_pred": len(set(all_preds)),
     }
 
-    print(f"\n{'='*50}")
-    print(f"  EVALUATION RESULTS")
-    print(f"{'='*50}")
-    print(f"  Macro F1:        {macro_f1:.3f}")
-    print(f"  Accuracy:        {accuracy:.1%} ({correct}/{total})")
-    print(f"\n  Per-class breakdown:")
-    all_labels = sorted(set(per_class_total.keys()) | set(per_class_predicted.keys()))
-    for label in all_labels:
-        tp = per_class_correct.get(label, 0)
-        sup = per_class_total.get(label, 0)
-        pred = per_class_predicted.get(label, 0)
-        prec = tp / max(pred, 1)
-        rec = tp / max(sup, 1)
-        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
-        metrics["per_class"][label] = {
-            "precision": prec, "recall": rec, "f1": f1,
-            "support": sup, "predicted": pred, "tp": tp,
-        }
-        print(f"    {label:15s}  P={prec:.2f}  R={rec:.2f}  F1={f1:.3f}  "
-              f"(TP={tp}, support={sup}, predicted={pred})")
+    # Print summary
+    print(f"\n  --- {tag} Results ---")
+    print(f"  Accuracy:  {accuracy:.4f}")
+    print(f"  Macro F1:  {macro_f1:.4f}")
+    print(f"  Samples:   {len(all_gts)}")
+    print(f"  GT classes: {len(label_set)}, Pred classes: {len(set(all_preds))}")
 
-    # Sample predictions
-    print(f"\n  Sample predictions:")
-    for r in results[:10]:
-        icon = "✓" if r["correct"] else "✗"
-        print(f"    {icon} GT: {r['label']:15s} → Pred: {r['pred_label']:15s} "
-              f"(reward={r['reward']:.2f})")
+    # Per-class report
+    try:
+        report = classification_report(
+            all_gts, all_preds, zero_division=0, output_dict=True
+        )
+        result["per_class"] = report
+        print(classification_report(all_gts, all_preds, zero_division=0))
+    except Exception:
+        pass
 
-    return metrics
+    return result
 
 
-def _description_to_label(description: str, dataset: HARDataset) -> str:
-    """Map a predicted activity description back to the short label."""
-    desc_lower = description.lower().strip()
-    for i in range(min(200, len(dataset))):
-        if dataset.descriptions[i].lower().strip() == desc_lower:
-            return dataset.labels[i]
-    for label in sorted(set(dataset.labels)):
-        if label.lower() in desc_lower:
-            return label
-    return "UNKNOWN"
+# ============================================================================
+# Single-dataset or merged evaluation
+# ============================================================================
+
+def run_standard(args, datasets: dict) -> list:
+    """
+    Standard evaluation: train VQ-VAE on all training data,
+    bootstrap memory, then evaluate on each test set + combined.
+    """
+    results = []
+    target_rate = args.target_rate
+
+    # Collect all training IMU for VQ-VAE pre-training
+    all_train_imu = []
+    all_train_tokens_data = []  # (dataset_name, train_ds, imu_position)
+
+    for name, ds_info in datasets.items():
+        train_ds = resample_if_needed(ds_info["train"], target_rate)
+        train_ds = pad_channels(train_ds, 6)
+        ds_info["train_processed"] = train_ds
+        test_ds = resample_if_needed(ds_info["test"], target_rate)
+        test_ds = pad_channels(test_ds, 6)
+        ds_info["test_processed"] = test_ds
+
+        # Gather IMU for VQ-VAE training
+        for i in range(len(train_ds)):
+            imu, _, _ = train_ds[i]
+            all_train_imu.append(imu)
+
+        all_train_tokens_data.append((name, train_ds, ds_info["imu_position"]))
+
+    # ── VQ-VAE Pre-training ──────────────────────────────────────────────
+    imu_config = IMUTokenizerConfig(
+        num_channels=6,
+        sampling_rate=target_rate,
+    )
+    pipeline = NemesisPipeline(
+        imu_config=imu_config,
+        device="cuda" if args.gpu else "cpu",
+    )
+
+    ckpt_tag = "_".join(sorted(datasets.keys()))
+    ckpt_path = os.path.join(CHECKPOINTS_DIR, f"vqvae_{ckpt_tag}_{target_rate}Hz.pt")
+
+    if os.path.exists(ckpt_path) and not args.retrain:
+        print(f"\n[VQ-VAE] Loading checkpoint: {ckpt_path}")
+        pipeline.tokenizer.load_pretrained(ckpt_path)
+    else:
+        print(f"\n[VQ-VAE] Training on {len(all_train_imu)} samples from "
+              f"{list(datasets.keys())}...")
+        pipeline.pretrain_tokenizer(
+            imu_data_list=all_train_imu,
+            num_epochs=args.vqvae_epochs,
+            batch_size=256,
+            patience=15,
+        )
+        os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
+        pipeline.tokenizer.save_pretrained(ckpt_path)
+
+    # ── Bootstrap Memory ─────────────────────────────────────────────────
+    pipeline.memory.clear()
+    for name, train_ds, imu_pos in all_train_tokens_data:
+        print(f"\n[Memory] Bootstrapping from {name} ({len(train_ds)} samples)...")
+        pipeline.set_sensor_context(
+            num_channels=6,
+            channel_names=train_ds.channels,
+            sampling_rate=target_rate,
+            dataset=name,
+            imu_position=imu_pos,
+        )
+        # Tokenize
+        tokens_list = []
+        labels_list = []
+        max_bootstrap = min(len(train_ds), args.max_bootstrap)
+        rng = np.random.RandomState(42)
+        idx = rng.choice(len(train_ds), max_bootstrap, replace=False) if len(train_ds) > max_bootstrap else np.arange(len(train_ds))
+        for i in idx:
+            imu, _, _ = train_ds[int(i)]
+            tokens = pipeline.tokenizer.tokenize(imu)
+            tokens_list.append(tokens)
+            labels_list.append(train_ds.labels[int(i)])
+
+        pipeline.bootstrap_memory(tokens_list, labels_list)
+
+    print(f"\n[Memory] Total entries: {pipeline.memory.count()}")
+
+    # ── Memory Learning (prototype refinement + prompt tuning) ───────────
+    if args.learn_epochs > 0:
+        # Prepare tokenized training data for learning
+        learn_tokens, learn_descs, learn_gts = [], [], []
+        for name, train_ds, imu_pos in all_train_tokens_data:
+            pipeline.set_sensor_context(
+                num_channels=6, channel_names=train_ds.channels,
+                sampling_rate=target_rate, dataset=name, imu_position=imu_pos,
+            )
+            max_learn = min(len(train_ds), args.max_bootstrap)
+            rng = np.random.RandomState(123)
+            idx = rng.choice(len(train_ds), max_learn, replace=False) if len(train_ds) > max_learn else np.arange(len(train_ds))
+            for i in idx:
+                imu, desc, label = train_ds[int(i)]
+                tokens = pipeline.tokenizer.tokenize(imu)
+                learn_tokens.append(tokens)
+                learn_descs.append(pipeline.descriptor.describe(tokens))
+                learn_gts.append(label)
+
+        pipeline.set_activity_options(sorted(set(learn_gts)))
+        pipeline.learn_loop(
+            tokens_list=learn_tokens,
+            descriptions=learn_descs,
+            ground_truths=learn_gts,
+            num_epochs=args.learn_epochs,
+            patience=args.learn_patience,
+            max_workers=args.max_workers,
+            batch_size=args.batch_size,
+        )
+
+    # ── Evaluate per-dataset ─────────────────────────────────────────────
+    for name, ds_info in datasets.items():
+        test_ds = ds_info["test_processed"]
+        train_ds = ds_info["train_processed"]
+        pipeline.set_sensor_context(
+            num_channels=6,
+            channel_names=test_ds.channels,
+            sampling_rate=target_rate,
+            dataset=name,
+            imu_position=ds_info["imu_position"],
+        )
+        pipeline.set_activity_options(sorted(set(test_ds.labels)))
+
+        tag = f"{name} ({target_rate}Hz)"
+        r = evaluate_pipeline(
+            pipeline, test_ds,
+            batch_size=args.batch_size,
+            max_workers=args.max_workers,
+            max_samples=args.max_eval_samples,
+            tag=tag,
+        )
+        r["dataset"] = name
+        results.append(r)
+
+    return results
+
+
+# ============================================================================
+# Leave-One-Dataset-Out (LODO) Evaluation
+# ============================================================================
+
+def run_lodo(args, datasets: dict) -> list:
+    """
+    For each dataset D, train on ALL other datasets, evaluate on D.
+    Tests how well knowledge transfers between domains.
+    """
+    all_names = sorted(datasets.keys())
+    results = []
+    target_rate = args.target_rate
+
+    for held_out in all_names:
+        print(f"\n{'#'*70}")
+        print(f"  LODO: Held-out = {held_out}")
+        print(f"  Training on: {[n for n in all_names if n != held_out]}")
+        print(f"{'#'*70}")
+
+        # Collect training data from all OTHER datasets
+        train_names = [n for n in all_names if n != held_out]
+        all_train_imu = []
+        all_train_tokens_data = []
+
+        for name in train_names:
+            ds_info = datasets[name]
+            train_ds = resample_if_needed(ds_info["train"], target_rate)
+            train_ds = pad_channels(train_ds, 6)
+            for i in range(len(train_ds)):
+                imu, _, _ = train_ds[i]
+                all_train_imu.append(imu)
+            all_train_tokens_data.append((name, train_ds, ds_info["imu_position"]))
+
+        # Prepare held-out test
+        held_info = datasets[held_out]
+        held_test = resample_if_needed(held_info["test"], target_rate)
+        held_test = pad_channels(held_test, 6)
+
+        # Fresh pipeline
+        imu_config = IMUTokenizerConfig(num_channels=6, sampling_rate=target_rate)
+        pipeline = NemesisPipeline(
+            imu_config=imu_config,
+            device="cuda" if args.gpu else "cpu",
+        )
+
+        # VQ-VAE
+        ckpt_tag = "lodo_" + "_".join(train_names)
+        ckpt_path = os.path.join(CHECKPOINTS_DIR, f"vqvae_{ckpt_tag}_{target_rate}Hz.pt")
+
+        if os.path.exists(ckpt_path) and not args.retrain:
+            pipeline.tokenizer.load_pretrained(ckpt_path)
+        else:
+            print(f"[VQ-VAE] Training on {len(all_train_imu)} samples...")
+            pipeline.pretrain_tokenizer(
+                imu_data_list=all_train_imu,
+                num_epochs=args.vqvae_epochs,
+                batch_size=256,
+                patience=15,
+            )
+            os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
+            pipeline.tokenizer.save_pretrained(ckpt_path)
+
+        # Bootstrap memory from training datasets only
+        pipeline.memory.clear()
+        for name, train_ds, imu_pos in all_train_tokens_data:
+            pipeline.set_sensor_context(
+                num_channels=6,
+                channel_names=train_ds.channels,
+                sampling_rate=target_rate,
+                dataset=name,
+                imu_position=imu_pos,
+            )
+            tokens_list, labels_list = [], []
+            max_bootstrap = min(len(train_ds), args.max_bootstrap)
+            rng = np.random.RandomState(42)
+            idx = rng.choice(len(train_ds), max_bootstrap, replace=False) if len(train_ds) > max_bootstrap else np.arange(len(train_ds))
+            for i in idx:
+                imu, _, _ = train_ds[int(i)]
+                tokens = pipeline.tokenizer.tokenize(imu)
+                tokens_list.append(tokens)
+                labels_list.append(train_ds.labels[int(i)])
+            pipeline.bootstrap_memory(tokens_list, labels_list)
+
+        print(f"[Memory] Total entries after bootstrap: {pipeline.memory.count()}")
+
+        # ── Memory Learning ──────────────────────────────────────────────
+        if args.learn_epochs > 0:
+            learn_tokens, learn_descs, learn_gts = [], [], []
+            for name, train_ds, imu_pos in all_train_tokens_data:
+                pipeline.set_sensor_context(
+                    num_channels=6, channel_names=train_ds.channels,
+                    sampling_rate=target_rate, dataset=name, imu_position=imu_pos,
+                )
+                max_learn = min(len(train_ds), args.max_bootstrap)
+                rng = np.random.RandomState(123)
+                idx = rng.choice(len(train_ds), max_learn, replace=False) if len(train_ds) > max_learn else np.arange(len(train_ds))
+                for i in idx:
+                    imu, desc, label = train_ds[int(i)]
+                    tokens = pipeline.tokenizer.tokenize(imu)
+                    learn_tokens.append(tokens)
+                    learn_descs.append(pipeline.descriptor.describe(tokens))
+                    learn_gts.append(label)
+
+            pipeline.set_activity_options(sorted(set(learn_gts)))
+            pipeline.learn_loop(
+                tokens_list=learn_tokens,
+                descriptions=learn_descs,
+                ground_truths=learn_gts,
+                num_epochs=args.learn_epochs,
+                patience=args.learn_patience,
+                max_workers=args.max_workers,
+                batch_size=args.batch_size,
+            )
+
+        # Evaluate on held-out
+        pipeline.set_sensor_context(
+            num_channels=6,
+            channel_names=held_test.channels,
+            sampling_rate=target_rate,
+            dataset=held_out,
+            imu_position=held_info["imu_position"],
+        )
+        pipeline.set_activity_options(sorted(set(held_test.labels)))
+
+        tag = f"LODO held={held_out}"
+        r = evaluate_pipeline(
+            pipeline, held_test,
+            batch_size=args.batch_size,
+            max_workers=args.max_workers,
+            max_samples=args.max_eval_samples,
+            tag=tag,
+        )
+        r["held_out"] = held_out
+        r["train_datasets"] = train_names
+        results.append(r)
+
+        print(f"  >>> LODO {held_out}: Macro F1 = {r['macro_f1']:.4f}, "
+              f"Accuracy = {r['accuracy']:.4f}")
+
+    # Summary
+    print(f"\n{'='*70}")
+    print("  LODO Summary")
+    print(f"{'='*70}")
+    f1s = []
+    for r in results:
+        f1s.append(r["macro_f1"])
+        print(f"  {r['held_out']:15s}  F1={r['macro_f1']:.4f}  Acc={r['accuracy']:.4f}")
+    print(f"  {'Mean':15s}  F1={np.mean(f1s):.4f}")
+
+    return results
 
 
 # ============================================================================
 # Main
 # ============================================================================
 
-def run(args):
-    """Main training + evaluation flow."""
-
-    print("\n" + "=" * 60)
-    print("  NEMESIS — Few-Shot Memory Mode")
-    print("  VQ-VAE tokens → memory query → few-shot LLM classify")
-    print("=" * 60)
-
-    # ----- Load dataset -----
-    if args.dataset == "uci_har":
-        train_data = load_uci_har(split="train", description_style="standard")
-        test_data = load_uci_har(split="test", description_style="standard")
-    elif args.dataset == "opportunity":
-        train_data = load_opportunity(split="train", description_style="rich")
-        test_data = load_opportunity(split="test", description_style="rich")
-    else:
-        raise ValueError(f"Unknown dataset: {args.dataset}")
-
-    print_dataset_info(train_data)
-    print_dataset_info(test_data)
-
-    # ----- Configure -----
-    num_channels = train_data.num_channels
-    imu_config = IMUTokenizerConfig(
-        num_channels=num_channels,
-        window_size=25,
-        window_overlap=5,
-        sampling_rate=train_data.sampling_rate,
-    )
-
-    classifier_config = ClassifierConfig(
-        model=args.model,
-        correct_reward=1.0,
-        wrong_reward=-1.0,
-        partial_reward=0.3,
-    )
-
-    memory_config = MemoryConfig(
-        db_path=os.path.join(MEMORY_DIR, f"{args.dataset}_memory.db"),
-        codebook_size=imu_config.codebook_size,
-        top_k=args.top_k,
-        store_threshold=0.6,
-        promote_threshold=0.85,
-    )
-
-    learner_config = LearnerConfig(
-        learn_epochs=args.learn_epochs,
-    )
-
-    # ----- Initialise pipeline -----
-    pipeline = NemesisPipeline(
-        imu_config=imu_config,
-        classifier_config=classifier_config,
-        memory_config=memory_config,
-        learner_config=learner_config,
-        device=args.device,
-    )
-
-    # Activity options
-    activity_descriptions = list(set(train_data.descriptions))
-    pipeline.set_activity_options(activity_descriptions)
-
-    # Sensor context
-    channel_names = train_data.channels
-    if train_data.is_variable_length:
-        length_stats = train_data.get_length_stats()
-        window_duration = length_stats['mean'] / train_data.sampling_rate
-    else:
-        window_samples = train_data.X.shape[1]
-        window_duration = window_samples / train_data.sampling_rate
-
-    # Determine IMU position from dataset
-    imu_position = ""
-    if args.dataset == "opportunity":
-        imu_position = "BACK"
-    elif args.dataset == "uci_har":
-        imu_position = "WAIST"
-
-    pipeline.set_sensor_context(
-        num_channels=num_channels,
-        channel_names=channel_names,
-        sampling_rate=train_data.sampling_rate,
-        window_duration_sec=window_duration,
-        dataset=args.dataset,
-        imu_position=imu_position,
-    )
-
-    # ----- VQ-VAE pre-training -----
-    vqvae_ckpt = os.path.join(CHECKPOINTS_DIR, "vqvae_pretrained.pt")
-    if os.path.isfile(vqvae_ckpt) and not args.retrain_vqvae:
-        print(f"\n--- Loading pre-trained VQ-VAE from {vqvae_ckpt} ---")
-        pipeline.tokenizer = VQVAE_Tokenizer.load_pretrained(
-            vqvae_ckpt, device=args.device
-        )
-        print("  VQ-VAE loaded successfully.")
-    else:
-        print("\n--- VQ-VAE Pre-training ---")
-        raw_imu_list = [train_data.X[i] for i in range(len(train_data))]
-        pipeline.pretrain_tokenizer(
-            raw_imu_list,
-            num_epochs=args.vqvae_epochs,
-            patience=args.vqvae_patience,
-        )
-
-    # ----- Calibrate rewards -----
-    class_weights = train_data.get_class_weights()
-    n_classes = len(set(train_data.y.tolist()))
-    pipeline.classifier.calibrate_rewards(
-        n_classes=n_classes,
-        class_weights=class_weights,
-    )
-
-    # ----- Bootstrap memory -----
-    if args.clear_memory:
-        print("\n--- Clearing memory ---")
-        pipeline.memory.clear()
-
-    if pipeline.memory.count() == 0:
-        print("\n--- Bootstrapping memory from training data ---")
-        print(f"  Tokenizing {len(train_data)} training samples...")
-        tokens_list = []
-        train_labels = []
-        for i in range(len(train_data)):
-            imu_data, desc, label = train_data.get_sample(i)
-            tokens = pipeline.tokenizer.tokenize(imu_data)
-            tokens_list.append(tokens)
-            train_labels.append(desc)  # use description (full activity name)
-        pipeline.bootstrap_memory(tokens_list, train_labels)
-    else:
-        print(f"\n--- Memory already populated: {pipeline.memory.count()} entries ---")
-
-    # ----- Show sample description -----
-    print("\n--- Sample Token Description ---")
-    sample_imu, sample_desc, sample_label = test_data.get_sample(0)
-    sample_tokens = pipeline.tokenizer.tokenize(sample_imu)
-    print(pipeline.descriptor.describe(sample_tokens))
-    print(f"\n(Ground truth: {sample_label} — {sample_desc})")
-
-    # ----- Learning epochs (Prototype Refinement + Prompt Tuning) -----
-    if args.learn_epochs > 0:
-        print(f"\n--- Online Learning ({args.learn_epochs} epoch(s)) ---")
-        print("  Prototype refinement + prompt tuning on training data")
-
-        # Use a subset for learning (max 500 to limit API cost)
-        learn_n = min(args.learn_samples, len(train_data))
-        learn_data = train_data.shuffle(seed=42).subset(learn_n)
-
-        # Pre-tokenize + pre-describe the learning set
-        learn_tokens = []
-        learn_descs = []
-        learn_gts = []
-        for i in range(len(learn_data)):
-            imu_data, desc, label = learn_data.get_sample(i)
-            toks = pipeline.tokenizer.tokenize(imu_data)
-            learn_tokens.append(toks)
-            learn_descs.append(pipeline.descriptor.describe(toks))
-            learn_gts.append(desc)
-
-        for epoch in range(args.learn_epochs):
-            print(f"\n  === Learning Epoch {epoch+1}/{args.learn_epochs} ===")
-            epoch_metrics = pipeline.learn_epoch(
-                tokens_list=learn_tokens,
-                descriptions=learn_descs,
-                ground_truths=learn_gts,
-                max_workers=args.workers,
-                batch_size=32,
-            )
-        # Clear LLM cache so eval gets fresh predictions with updated retrieval
-        pipeline.classifier._cache.clear()
-
-    # ----- Evaluate -----
-    print("\n--- Evaluation ---")
-    eval_metrics = evaluate(
-        pipeline, test_data,
-        max_samples=args.eval_samples,
-        verbose=True,
-        api_workers=args.workers,
-    )
-
-    # ----- Promote and show memory stats -----
-    pipeline.memory.promote_short_term()
-    pipeline.memory._print_stats()
-
-    # ----- Save results -----
-    results = {
-        "args": vars(args),
-        "mode": "few_shot_memory",
-        "eval": eval_metrics,
-        "memory_entries": pipeline.memory.count(),
-    }
-    save_results(results, args)
-    print("\nDone!")
-
-
-def save_results(results: Dict, args):
-    """Save evaluation results to JSON."""
-    os.makedirs(os.path.join(PROJECT_ROOT, "results"), exist_ok=True)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(PROJECT_ROOT, "results", f"{args.dataset}_{timestamp}.json")
-    with open(path, "w") as f:
-        json.dump(results, f, indent=2, default=str)
-    print(f"[Results] Saved to {path}")
-
-
-# ============================================================================
-# CLI
-# ============================================================================
-
-def parse_args():
+def main():
     parser = argparse.ArgumentParser(
-        description="NEMESIS — Few-shot memory mode for HAR"
+        description="NEMESIS multi-dataset HAR training & evaluation"
     )
+    parser.add_argument(
+        "--dataset", nargs="+", default=["opportunity"],
+        help="Datasets to use. 'all' for all 8. Or list: opportunity pamap2 ...",
+    )
+    parser.add_argument(
+        "--lodo", action="store_true",
+        help="Leave-One-Dataset-Out cross-validation",
+    )
+    parser.add_argument(
+        "--target-rate", type=int, default=30,
+        help="Common resampling rate (Hz) for merging datasets (default: 30)",
+    )
+    parser.add_argument(
+        "--vqvae-epochs", type=int, default=1000,
+        help="VQ-VAE pre-training epochs (default: 200)",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=32,
+        help="Evaluation batch size (default: 32)",
+    )
+    parser.add_argument(
+        "--max-workers", type=int, default=8,
+        help="Parallel LLM threads (default: 8)",
+    )
+    parser.add_argument(
+        "--max-eval-samples", type=int, default=200,
+        help="Max samples per dataset for evaluation (default: 200)",
+    )
+    parser.add_argument(
+        "--max-bootstrap", type=int, default=500,
+        help="Max samples per dataset for memory bootstrap (default: 500)",
+    )
+    parser.add_argument(
+        "--learn-epochs", type=int, default=100,
+        help="Memory learning epochs (prototype refinement + prompt tuning, default: 100, 0 to skip)",
+    )
+    parser.add_argument(
+        "--learn-patience", type=int, default=10,
+        help="Early stopping patience for memory learning (default: 10)",
+    )
+    parser.add_argument(
+        "--retrain", action="store_true",
+        help="Force VQ-VAE retraining even if checkpoint exists",
+    )
+    parser.add_argument(
+        "--gpu", action="store_true",
+        help="Use CUDA GPU",
+    )
+    parser.add_argument(
+        "--output", type=str, default="results.json",
+        help="Output JSON file for results",
+    )
+    args = parser.parse_args()
 
-    # Dataset
-    parser.add_argument("--dataset", type=str, default="opportunity",
-                        choices=["uci_har", "opportunity"],
-                        help="Which dataset to use")
+    # Resolve 'all'
+    requested = args.dataset
+    if "all" in requested:
+        requested = list(DATASET_LOADERS.keys())
 
-    # Evaluation
-    parser.add_argument("--eval-samples", type=int, default=0,
-                        help="Eval samples (0 = full test set)")
+    print(f"\n{'='*70}")
+    print(f"  NEMESIS Multi-Dataset HAR")
+    print(f"{'='*70}")
+    print(f"  Datasets:     {requested}")
+    print(f"  LODO:         {args.lodo}")
+    print(f"  Target rate:  {args.target_rate} Hz")
+    print(f"  VQ-VAE epochs:{args.vqvae_epochs}")
+    print(f"  Learn epochs: {args.learn_epochs} (patience={args.learn_patience})")
+    print(f"  Max eval:     {args.max_eval_samples} per dataset")
+    print(f"  Output:       {args.output}")
+    print()
 
-    # Model
-    parser.add_argument("--model", type=str, default="gpt-4.1-mini",
-                        help="OpenAI model for classification")
-    parser.add_argument("--device", type=str, default="cpu",
-                        help="Device (cpu or cuda)")
+    # ── Load all requested datasets ──────────────────────────────────────
+    datasets = {}
+    failed = []
+    for name in requested:
+        try:
+            ds_info = load_single_dataset(name)
+            datasets[name] = ds_info
+            print_dataset_info(ds_info["train"])
+            print_dataset_info(ds_info["test"])
+        except Exception as e:
+            print(f"\n[ERROR] Failed to load '{name}': {e}")
+            traceback.print_exc()
+            failed.append(name)
 
-    # VQ-VAE
-    parser.add_argument("--vqvae-epochs", type=int, default=200,
-                        help="Max VQ-VAE pre-training epochs")
-    parser.add_argument("--vqvae-patience", type=int, default=15,
-                        help="VQ-VAE early stopping patience")
-    parser.add_argument("--retrain-vqvae", action="store_true",
-                        help="Force re-train VQ-VAE even if checkpoint exists")
+    if not datasets:
+        print("[FATAL] No datasets loaded successfully. Exiting.")
+        sys.exit(1)
 
-    # Memory
-    parser.add_argument("--top-k", type=int, default=5,
-                        help="Number of few-shot neighbours to retrieve")
-    parser.add_argument("--clear-memory", action="store_true",
-                        help="Clear memory DB before bootstrapping")
+    if failed:
+        print(f"\n[WARNING] Failed datasets: {failed}")
+        print(f"[WARNING] Continuing with {list(datasets.keys())}")
 
-    # Learning
-    parser.add_argument("--learn-epochs", type=int, default=2,
-                        help="Online learning epochs (0 = no learning)")
-    parser.add_argument("--learn-samples", type=int, default=500,
-                        help="Max training samples per learning epoch")
+    print(f"\n  Successfully loaded {len(datasets)} datasets: "
+          f"{list(datasets.keys())}")
 
-    # Parallelism
-    parser.add_argument("--workers", type=int, default=8,
-                        help="Parallel OpenAI API threads")
+    # ── Run evaluation ───────────────────────────────────────────────────
+    t0 = time.time()
 
-    return parser.parse_args()
+    if args.lodo and len(datasets) >= 2:
+        results = run_lodo(args, datasets)
+    else:
+        if args.lodo and len(datasets) < 2:
+            print("[WARNING] LODO requires ≥2 datasets. Running standard eval.")
+        results = run_standard(args, datasets)
+
+    elapsed = time.time() - t0
+
+    # ── Save results ─────────────────────────────────────────────────────
+    output = {
+        "datasets_loaded": list(datasets.keys()),
+        "datasets_failed": failed,
+        "mode": "lodo" if args.lodo and len(datasets) >= 2 else "standard",
+        "target_rate": args.target_rate,
+        "elapsed_seconds": elapsed,
+        "results": [],
+    }
+    for r in results:
+        entry = {k: v for k, v in r.items() if k != "per_class"}
+        output["results"].append(entry)
+
+    with open(args.output, "w") as f:
+        json.dump(output, f, indent=2, default=str)
+
+    print(f"\n{'='*70}")
+    print(f"  Done! Elapsed: {elapsed:.1f}s")
+    print(f"  Results saved to: {args.output}")
+    print(f"{'='*70}")
+
+    # Print final summary table
+    print(f"\n  {'Dataset':<20s} {'Macro F1':<12s} {'Accuracy':<12s} {'Samples':<10s}")
+    print(f"  {'─'*54}")
+    for r in results:
+        tag = r.get("held_out", r.get("dataset", r.get("tag", "?")))
+        print(f"  {tag:<20s} {r['macro_f1']:<12.4f} {r['accuracy']:<12.4f} "
+              f"{r['n_samples']:<10d}")
+
+    if len(results) > 1:
+        avg_f1 = np.mean([r["macro_f1"] for r in results])
+        avg_acc = np.mean([r["accuracy"] for r in results])
+        print(f"  {'─'*54}")
+        print(f"  {'MEAN':<20s} {avg_f1:<12.4f} {avg_acc:<12.4f}")
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    run(args)
+    main()

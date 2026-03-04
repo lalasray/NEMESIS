@@ -1,0 +1,80 @@
+{
+  "datasets_loaded": [
+    "opportunity",
+    "uci_har",
+    "pamap2",
+    "mhealth",
+    "daphnet",
+    "dsa",
+    "hapt"
+  ],
+  "datasets_failed": [],
+  "mode": "standard",
+  "target_rate": 30,
+  "elapsed_seconds": 2825.3844804763794,
+  "results": [
+    {
+      "tag": "opportunity (30Hz)",
+      "accuracy": 0.68,
+      "macro_f1": 0.4055066411211332,
+      "n_samples": 100,
+      "n_classes_gt": 4,
+      "n_classes_pred": 3,
+      "dataset": "opportunity"
+    },
+    {
+      "tag": "uci_har (30Hz)",
+      "accuracy": 0.13,
+      "macro_f1": 0.038348082595870206,
+      "n_samples": 100,
+      "n_classes_gt": 6,
+      "n_classes_pred": 1,
+      "dataset": "uci_har"
+    },
+    {
+      "tag": "pamap2 (30Hz)",
+      "accuracy": 0.4,
+      "macro_f1": 0.31816770283454904,
+      "n_samples": 100,
+      "n_classes_gt": 12,
+      "n_classes_pred": 11,
+      "dataset": "pamap2"
+    },
+    {
+      "tag": "mhealth (30Hz)",
+      "accuracy": 0.3,
+      "macro_f1": 0.1952457264957265,
+      "n_samples": 100,
+      "n_classes_gt": 12,
+      "n_classes_pred": 5,
+      "dataset": "mhealth"
+    },
+    {
+      "tag": "daphnet (30Hz)",
+      "accuracy": 0.8,
+      "macro_f1": 0.4444444444444444,
+      "n_samples": 100,
+      "n_classes_gt": 2,
+      "n_classes_pred": 2,
+      "dataset": "daphnet"
+    },
+    {
+      "tag": "dsa (30Hz)",
+      "accuracy": 0.19,
+      "macro_f1": 0.11715652768284347,
+      "n_samples": 100,
+      "n_classes_gt": 19,
+      "n_classes_pred": 7,
+      "dataset": "dsa"
+    },
+    {
+      "tag": "hapt (30Hz)",
+      "accuracy": 0.16,
+      "macro_f1": 0.03940886699507389,
+      "n_samples": 100,
+      "n_classes_gt": 7,
+      "n_classes_pred": 1,
+      "dataset": "hapt"
+    }
+  ]
+}

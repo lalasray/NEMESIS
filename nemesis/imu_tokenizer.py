@@ -468,7 +468,7 @@ class VQVAE_Tokenizer(nn.Module):
     def train_vqvae(
         self,
         imu_data_list: List[np.ndarray],
-        num_epochs: int = 200,
+        num_epochs: int = 1000,
         batch_size: int = 256,
         lr: float = 1e-3,
         device: str = "cpu",
