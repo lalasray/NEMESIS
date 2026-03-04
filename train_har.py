@@ -27,7 +27,7 @@ from typing import Dict, List, Optional
 from collections import defaultdict
 
 from nemesis.config import (
-    IMUTokenizerConfig, ClassifierConfig, MemoryConfig,
+    IMUTokenizerConfig, ClassifierConfig, MemoryConfig, LearnerConfig,
     CHECKPOINTS_DIR, PROJECT_ROOT, MEMORY_DIR,
 )
 from nemesis.datasets import (
@@ -241,11 +241,16 @@ def run(args):
         promote_threshold=0.85,
     )
 
+    learner_config = LearnerConfig(
+        learn_epochs=args.learn_epochs,
+    )
+
     # ----- Initialise pipeline -----
     pipeline = NemesisPipeline(
         imu_config=imu_config,
         classifier_config=classifier_config,
         memory_config=memory_config,
+        learner_config=learner_config,
         device=args.device,
     )
 
@@ -329,6 +334,38 @@ def run(args):
     print(pipeline.descriptor.describe(sample_tokens))
     print(f"\n(Ground truth: {sample_label} — {sample_desc})")
 
+    # ----- Learning epochs (Prototype Refinement + Prompt Tuning) -----
+    if args.learn_epochs > 0:
+        print(f"\n--- Online Learning ({args.learn_epochs} epoch(s)) ---")
+        print("  Prototype refinement + prompt tuning on training data")
+
+        # Use a subset for learning (max 500 to limit API cost)
+        learn_n = min(args.learn_samples, len(train_data))
+        learn_data = train_data.shuffle(seed=42).subset(learn_n)
+
+        # Pre-tokenize + pre-describe the learning set
+        learn_tokens = []
+        learn_descs = []
+        learn_gts = []
+        for i in range(len(learn_data)):
+            imu_data, desc, label = learn_data.get_sample(i)
+            toks = pipeline.tokenizer.tokenize(imu_data)
+            learn_tokens.append(toks)
+            learn_descs.append(pipeline.descriptor.describe(toks))
+            learn_gts.append(desc)
+
+        for epoch in range(args.learn_epochs):
+            print(f"\n  === Learning Epoch {epoch+1}/{args.learn_epochs} ===")
+            epoch_metrics = pipeline.learn_epoch(
+                tokens_list=learn_tokens,
+                descriptions=learn_descs,
+                ground_truths=learn_gts,
+                max_workers=args.workers,
+                batch_size=32,
+            )
+        # Clear LLM cache so eval gets fresh predictions with updated retrieval
+        pipeline.classifier._cache.clear()
+
     # ----- Evaluate -----
     print("\n--- Evaluation ---")
     eval_metrics = evaluate(
@@ -400,6 +437,12 @@ def parse_args():
                         help="Number of few-shot neighbours to retrieve")
     parser.add_argument("--clear-memory", action="store_true",
                         help="Clear memory DB before bootstrapping")
+
+    # Learning
+    parser.add_argument("--learn-epochs", type=int, default=2,
+                        help="Online learning epochs (0 = no learning)")
+    parser.add_argument("--learn-samples", type=int, default=500,
+                        help="Max training samples per learning epoch")
 
     # Parallelism
     parser.add_argument("--workers", type=int, default=8,

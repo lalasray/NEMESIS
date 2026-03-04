@@ -82,3 +82,24 @@ class MemoryConfig:
     store_threshold: float = 0.6
     # Minimum confidence + neighbour agreement to promote to long-term
     promote_threshold: float = 0.85
+
+
+# ---------------------------------------------------------------------------
+# Online Learning (Prototype Refinement + Prompt Tuning)
+# ---------------------------------------------------------------------------
+@dataclass
+class LearnerConfig:
+    # Prototype EMA learning rate (attract correct)
+    prototype_lr: float = 0.05
+    # Prototype repel rate (push away wrong)
+    prototype_repel_lr: float = 0.02
+    # Effectiveness boost rate for helpful neighbours
+    effectiveness_boost_lr: float = 0.15
+    # Effectiveness decay rate for misleading neighbours
+    effectiveness_decay_lr: float = 0.10
+    # Exponent on effectiveness in retrieval reranking
+    effectiveness_alpha: float = 0.3
+    # Weight on prototype similarity in retrieval reranking
+    prototype_beta: float = 0.2
+    # Number of learning epochs (passes over training data)
+    learn_epochs: int = 2

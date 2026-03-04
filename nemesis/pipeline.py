@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
 from nemesis.config import (
-    IMUTokenizerConfig, ClassifierConfig, MemoryConfig,
+    IMUTokenizerConfig, ClassifierConfig, MemoryConfig, LearnerConfig,
     load_api_key, CHECKPOINTS_DIR,
 )
 from nemesis.imu_tokenizer import VQVAE_Tokenizer
@@ -55,18 +55,20 @@ class NemesisPipeline:
         imu_config: IMUTokenizerConfig = IMUTokenizerConfig(),
         classifier_config: ClassifierConfig = ClassifierConfig(),
         memory_config: MemoryConfig = MemoryConfig(),
+        learner_config: LearnerConfig = LearnerConfig(),
         device: str = "cpu",
     ):
         self.device = device
         self.imu_config = imu_config
         self.classifier_config = classifier_config
         self.memory_config = memory_config
+        self.learner_config = learner_config
 
         # --- Components ---
         self.tokenizer = VQVAE_Tokenizer(imu_config)
         self.descriptor = TokenDescriptor(codebook_size=imu_config.codebook_size)
         self.classifier = OpenAIClassifier(classifier_config)
-        self.memory = MemoryStore(memory_config)
+        self.memory = MemoryStore(memory_config, learner_config)
 
         # Metadata for memory queries (set via set_sensor_context)
         self._dataset: str = ""
@@ -182,6 +184,132 @@ class NemesisPipeline:
             num_channels=self._num_channels,
             session_id=self._session_id,
         )
+
+    # ------------------------------------------------------------------
+    # Learning
+    # ------------------------------------------------------------------
+
+    def learn_epoch(
+        self,
+        tokens_list: List[List[int]],
+        descriptions: List[str],
+        ground_truths: List[str],
+        max_workers: int = 8,
+        batch_size: int = 32,
+    ) -> Dict:
+        """
+        One learning epoch: classify training samples, then update
+        prototypes + effectiveness scores based on results.
+
+        This is where actual parameter updates happen:
+          - Prototype centroids shift via EMA
+          - Effectiveness scores change for helpful/misleading entries
+
+        No LLM fine-tuning or gradient backprop — but the retrieval
+        system itself learns which examples to prefer.
+
+        Args:
+            tokens_list: Pre-tokenized training samples.
+            descriptions: Pre-computed descriptor texts.
+            ground_truths: Ground-truth activity labels (full descriptions).
+            max_workers: Parallel LLM threads.
+            batch_size: Samples per batch.
+
+        Returns:
+            Dict with epoch-level metrics (accuracy, corrections made).
+        """
+        from nemesis.memory import _token_histogram
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        N = len(tokens_list)
+        correct = 0
+        total = 0
+        updates = 0
+
+        # Process in batches
+        for start in range(0, N, batch_size):
+            end = min(start + batch_size, N)
+            batch_tokens = tokens_list[start:end]
+            batch_descs = descriptions[start:end]
+            batch_gts = ground_truths[start:end]
+            B = len(batch_tokens)
+
+            # Query neighbours for each sample
+            all_neighbours = []
+            for tokens in batch_tokens:
+                neighbours = self.memory.query(
+                    tokens=tokens,
+                    dataset=self._dataset,
+                    imu_position=self._imu_position,
+                    sampling_rate=self._sampling_rate,
+                )
+                all_neighbours.append(neighbours)
+
+            # Parallel LLM classification
+            activities = [None] * B
+
+            def _classify_one(idx):
+                desc = batch_descs[idx]
+                neighbours = all_neighbours[idx]
+                self.classifier.set_few_shot_examples(neighbours)
+                cache_key = hash(("learn", desc, str(neighbours)))
+                if cache_key in self.classifier._cache:
+                    return idx, self.classifier._cache[cache_key]
+                activity = self.classifier._call_llm(desc)
+                self.classifier._cache[cache_key] = activity
+                return idx, activity
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(_classify_one, i) for i in range(B)]
+                for future in as_completed(futures):
+                    idx, activity = future.result()
+                    activities[idx] = activity
+
+            # Update learning parameters
+            for i in range(B):
+                gt = batch_gts[i]
+                pred = activities[i]
+                reward = self.classifier.compute_reward(pred, gt)
+                is_correct = reward >= 0.8
+                if is_correct:
+                    correct += 1
+                total += 1
+
+                # Extract neighbour IDs and labels for learning update
+                neighbours = all_neighbours[i]
+                nb_ids = [n.get("entry_id", -1) for n in neighbours]
+                nb_labels = [n["activity"] for n in neighbours]
+
+                self.memory.update_learning(
+                    sample_tokens=batch_tokens[i],
+                    neighbour_ids=nb_ids,
+                    neighbour_labels=nb_labels,
+                    predicted_activity=pred,
+                    ground_truth=gt,
+                    is_correct=is_correct,
+                )
+                updates += 1
+
+            if total % (batch_size * 4) < batch_size:
+                acc = correct / max(total, 1)
+                print(f"    [{total}/{N}] Learning acc: {acc:.1%}")
+
+        # Save learned parameters
+        self.memory.save_learning()
+        # Invalidate index so next query uses updated scores
+        self.memory._index_meta = None
+
+        acc = correct / max(total, 1)
+        stats = self.memory.learning_stats()
+        print(f"  [Learn] Epoch done: {correct}/{total} = {acc:.1%}, "
+              f"updates={updates}")
+        if "effectiveness" in stats:
+            e = stats["effectiveness"]
+            print(f"  [Learn] Effectiveness: mean={e['mean']:.3f}, "
+                  f"min={e['min']:.3f}, max={e['max']:.3f}")
+
+        return {"accuracy": acc, "correct": correct, "total": total,
+                "updates": updates, "learning_stats": stats}
 
     def classify_batch(
         self,

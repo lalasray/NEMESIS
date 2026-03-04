@@ -29,7 +29,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from nemesis.config import MemoryConfig, CHECKPOINTS_DIR
+from nemesis.config import MemoryConfig, LearnerConfig, CHECKPOINTS_DIR
 
 
 # =====================================================================
@@ -95,8 +95,13 @@ class MemoryStore:
       metadata context so retrieval is a single matrix–vector dot.
     """
 
-    def __init__(self, config: MemoryConfig = MemoryConfig()):
+    def __init__(
+        self,
+        config: MemoryConfig = MemoryConfig(),
+        learner_config: LearnerConfig = LearnerConfig(),
+    ):
         self.config = config
+        self.learner_config = learner_config
         self.codebook_size = config.codebook_size
 
         os.makedirs(os.path.dirname(config.db_path) or ".", exist_ok=True)
@@ -112,6 +117,10 @@ class MemoryStore:
         self._index_confidences: Optional[List[float]] = None
         self._index_descriptors: Optional[List[str]] = None
         self._index_ids: Optional[List[int]] = None
+
+        # Online learning components (lazy-init after first bootstrap/build)
+        self._prototype_refiner = None
+        self._prompt_tuner = None
 
     # -----------------------------------------------------------------
     # Schema
@@ -262,9 +271,39 @@ class MemoryStore:
         print(f"  Stored {len(entries)} entries in long-term memory.")
         self._print_stats()
 
+        # Initialise learner components from the freshly-stored data
+        self._init_learners(dataset, imu_position, sampling_rate)
+
     # -----------------------------------------------------------------
     # Retrieval
     # -----------------------------------------------------------------
+
+    def _init_learners(self, dataset: str, imu_position: str, sampling_rate: int):
+        """Initialise prototype refiner + prompt tuner from current index."""
+        from nemesis.learner import PrototypeRefiner, PromptTuner
+
+        self._build_index(dataset, imu_position, sampling_rate)
+
+        lc = self.learner_config
+        self._prototype_refiner = PrototypeRefiner(
+            conn=self.conn,
+            codebook_size=self.codebook_size,
+            lr=lc.prototype_lr,
+            repel_lr=lc.prototype_repel_lr,
+        )
+        self._prompt_tuner = PromptTuner(
+            conn=self.conn,
+            boost_lr=lc.effectiveness_boost_lr,
+            decay_lr=lc.effectiveness_decay_lr,
+            alpha=lc.effectiveness_alpha,
+            beta=lc.prototype_beta,
+        )
+
+        # Initialise prototypes if empty
+        if self._prototype_refiner.num_prototypes == 0 and self._index_histograms.shape[0] > 0:
+            self._prototype_refiner.init_from_memory(
+                self._index_histograms, self._index_labels,
+            )
 
     def _build_index(self, dataset: str, imu_position: str, sampling_rate: int):
         """Build in-memory numpy index for fast cosine queries."""
@@ -358,12 +397,23 @@ class MemoryStore:
         q = _token_histogram(tokens, self.codebook_size)
 
         # Cosine similarities (single matrix-vector dot, very fast)
-        sims = self._index_histograms @ q
+        raw_sims = self._index_histograms @ q
 
         # Optional filter to long-term only
         if long_term_only:
             mask = np.array([t == "long_term" for t in self._index_tiers])
-            sims = np.where(mask, sims, -2.0)
+            raw_sims = np.where(mask, raw_sims, -2.0)
+
+        # Rerank with learner scores if available
+        if self._prompt_tuner is not None and self._prototype_refiner is not None:
+            proto_sims = self._prototype_refiner.get_prototype_similarities(
+                q, self._index_labels,
+            )
+            sims = self._prompt_tuner.rerank_scores(
+                raw_sims, self._index_ids, proto_sims,
+            )
+        else:
+            sims = raw_sims
 
         # Top K
         k = min(top_k, len(sims))
@@ -377,9 +427,11 @@ class MemoryStore:
             results.append({
                 "activity": self._index_labels[idx],
                 "similarity": float(sims[idx]),
+                "raw_similarity": float(raw_sims[idx]),
                 "confidence": self._index_confidences[idx],
                 "tier": self._index_tiers[idx],
                 "top_tokens": self._index_descriptors[idx],
+                "entry_id": self._index_ids[idx],
             })
         return results
 
@@ -489,8 +541,63 @@ class MemoryStore:
         total = lt + st
         print(f"  [Memory] Total: {total} (long_term={lt}, short_term={st})")
 
+    def update_learning(
+        self,
+        sample_tokens: List[int],
+        neighbour_ids: List[int],
+        neighbour_labels: List[str],
+        predicted_activity: str,
+        ground_truth: str,
+        is_correct: bool,
+    ):
+        """Update prototypes + effectiveness after one classification."""
+        if self._prototype_refiner is None or self._prompt_tuner is None:
+            return
+
+        sample_hist = _token_histogram(sample_tokens, self.codebook_size)
+
+        # Prototype refinement
+        self._prototype_refiner.update(
+            sample_histogram=sample_hist,
+            predicted_activity=predicted_activity,
+            ground_truth=ground_truth,
+            is_correct=is_correct,
+        )
+
+        # Prompt tuning
+        self._prompt_tuner.update_after_classification(
+            neighbour_ids=neighbour_ids,
+            neighbour_labels=neighbour_labels,
+            predicted_activity=predicted_activity,
+            ground_truth=ground_truth,
+            is_correct=is_correct,
+        )
+
+    def save_learning(self):
+        """Persist learned parameters (prototypes + effectiveness scores)."""
+        if self._prototype_refiner:
+            self._prototype_refiner.save_all()
+        if self._prompt_tuner:
+            self._prompt_tuner.save_all()
+
+    def learning_stats(self) -> Dict:
+        """Return summary of learning parameters."""
+        stats = {}
+        if self._prototype_refiner:
+            stats["num_prototypes"] = self._prototype_refiner.num_prototypes
+        if self._prompt_tuner:
+            stats["effectiveness"] = self._prompt_tuner.stats
+        return stats
+
     def clear(self):
-        """Delete all entries."""
+        """Delete all entries and learned parameters."""
         self.conn.execute("DELETE FROM memory")
+        # prototypes table may not exist if learner was never initialised
+        try:
+            self.conn.execute("DELETE FROM prototypes")
+        except sqlite3.OperationalError:
+            pass
         self.conn.commit()
         self._index_meta = None
+        self._prototype_refiner = None
+        self._prompt_tuner = None
