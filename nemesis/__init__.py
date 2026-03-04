@@ -1,11 +1,10 @@
 """
-NEMESIS — Neural Memory-augmented Symbolic Interface for Sensors
+NEMESIS — Neural Embedded Motion Encoding with Statistical Inference for Sensors
 
-Translates raw IMU sensor data into human activity labels through:
+Classifies human activities from raw IMU sensor data through:
   1. VQ-VAE tokenization (learned motion primitives)
-  2. Transformer translation to neuro-symbolic text (RL-trained), or
-  3. Statistical token description (zero-shot descriptor mode)
-  4. LLM classification via OpenAI API
+  2. Statistical token description (frequencies, entropy, transitions)
+  3. LLM classification via OpenAI API (zero-shot)
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
