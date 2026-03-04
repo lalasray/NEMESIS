@@ -59,10 +59,28 @@ from nemesis.pipeline import NemesisPipeline
 # Evaluation
 # ============================================================================
 
+def _compute_macro_f1(per_class_correct: Dict, per_class_total: Dict,
+                      per_class_predicted: Dict) -> float:
+    """Compute macro-averaged F1 score across all classes."""
+    f1_scores = []
+    all_labels = set(per_class_total.keys()) | set(per_class_predicted.keys())
+    for label in all_labels:
+        tp = per_class_correct.get(label, 0)
+        support = per_class_total.get(label, 0)       # true count
+        predicted = per_class_predicted.get(label, 0)  # predicted count
+        precision = tp / max(predicted, 1)
+        recall = tp / max(support, 1)
+        if precision + recall > 0:
+            f1_scores.append(2 * precision * recall / (precision + recall))
+        else:
+            f1_scores.append(0.0)
+    return float(np.mean(f1_scores)) if f1_scores else 0.0
+
+
 def evaluate(
     pipeline: NemesisPipeline,
     dataset: HARDataset,
-    max_samples: int = 100,
+    max_samples: int = 0,
     verbose: bool = True,
 ) -> Dict:
     """
@@ -73,18 +91,24 @@ def evaluate(
       2. OpenAI classifies it (picks from known activities)
       3. Compare classification to ground truth
 
+    Primary metric: **macro F1** (handles class imbalance).
+
+    Args:
+        max_samples: 0 = use entire dataset
+
     Returns:
-        Dictionary with accuracy, per-class accuracy, and confusion info
+        Dictionary with macro_f1, accuracy, per-class precision/recall/f1
     """
     reward_fn = pipeline.rl_trainer.reward_fn
 
-    n = min(max_samples, len(dataset))
+    n = min(max_samples, len(dataset)) if max_samples > 0 else len(dataset)
     dataset = dataset.shuffle(seed=99).subset(n)
 
     correct = 0
     total = 0
-    per_class_correct = defaultdict(int)
-    per_class_total = defaultdict(int)
+    per_class_correct = defaultdict(int)   # true positives per class
+    per_class_total = defaultdict(int)      # support (ground-truth count)
+    per_class_predicted = defaultdict(int)  # predicted count
     results = []
 
     print(f"\n[Eval] Evaluating on {n} samples from {dataset.dataset_name}/{dataset.split}...")
@@ -98,36 +122,46 @@ def evaluate(
             ground_truth=description,
             use_memory=False,
             train=False,
-            temperature=0.3,  # lower temperature for eval (more deterministic)
+            temperature=0.3,
         )
 
         # Check if prediction matches — use classification reward threshold
-        is_correct = result.confidence >= 0.8  # stricter threshold for classify mode
+        is_correct = result.confidence >= 0.8
         if is_correct:
             correct += 1
             per_class_correct[label] += 1
         per_class_total[label] += 1
+
+        # Track predicted label for precision calculation
+        # Map the predicted description back to the short label name
+        pred_label = _description_to_label(result.activity, dataset)
+        per_class_predicted[pred_label] += 1
         total += 1
 
         results.append({
             "label": label,
             "ground_truth": description,
             "predicted": result.activity,
+            "pred_label": pred_label,
             "reward": result.confidence,
             "symbolic": result.symbolic_text[:100],
             "correct": is_correct,
         })
 
-        if verbose and (i + 1) % 10 == 0:
-            acc_so_far = correct / total
-            print(f"  [{i+1}/{n}] Running accuracy: {acc_so_far:.1%}")
+        if verbose and (i + 1) % 20 == 0:
+            running_f1 = _compute_macro_f1(
+                per_class_correct, per_class_total, per_class_predicted)
+            print(f"  [{i+1}/{n}] Running macro-F1: {running_f1:.3f}")
 
         # Rate limit for OpenAI
         time.sleep(0.1)
 
     # Summary
     accuracy = correct / max(total, 1)
+    macro_f1 = _compute_macro_f1(per_class_correct, per_class_total,
+                                 per_class_predicted)
     metrics = {
+        "macro_f1": macro_f1,
         "accuracy": accuracy,
         "total": total,
         "correct": correct,
@@ -137,27 +171,46 @@ def evaluate(
     print(f"\n{'='*50}")
     print(f"  EVALUATION RESULTS")
     print(f"{'='*50}")
-    print(f"  Overall accuracy: {accuracy:.1%} ({correct}/{total})")
-    print(f"\n  Per-class accuracy:")
-    for label in sorted(per_class_total.keys()):
-        cls_correct = per_class_correct[label]
-        cls_total = per_class_total[label]
-        cls_acc = cls_correct / max(cls_total, 1)
+    print(f"  Macro F1:        {macro_f1:.3f}")
+    print(f"  Accuracy:        {accuracy:.1%} ({correct}/{total})")
+    print(f"\n  Per-class breakdown:")
+    all_labels = sorted(set(per_class_total.keys()) | set(per_class_predicted.keys()))
+    for label in all_labels:
+        tp = per_class_correct.get(label, 0)
+        sup = per_class_total.get(label, 0)
+        pred = per_class_predicted.get(label, 0)
+        prec = tp / max(pred, 1)
+        rec = tp / max(sup, 1)
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
         metrics["per_class"][label] = {
-            "accuracy": cls_acc,
-            "correct": cls_correct,
-            "total": cls_total,
+            "precision": prec, "recall": rec, "f1": f1,
+            "support": sup, "predicted": pred, "tp": tp,
         }
-        print(f"    {label:25s}: {cls_acc:.1%} ({cls_correct}/{cls_total})")
+        print(f"    {label:15s}  P={prec:.2f}  R={rec:.2f}  F1={f1:.3f}  "
+              f"(TP={tp}, support={sup}, predicted={pred})")
 
     # Show some examples
     print(f"\n  Sample predictions:")
     for r in results[:10]:
         icon = "✓" if r["correct"] else "✗"
-        print(f"    {icon} GT: {r['label']:20s} → Predicted: {r['predicted'][:30]:30s} "
+        print(f"    {icon} GT: {r['label']:15s} → Pred: {r['pred_label']:15s} "
               f"(reward={r['reward']:.2f})")
 
     return metrics
+
+
+def _description_to_label(description: str, dataset: HARDataset) -> str:
+    """Map a predicted activity description back to the short label."""
+    desc_lower = description.lower().strip()
+    # Try exact match from the dataset's description→label mapping
+    for i in range(min(200, len(dataset))):
+        if dataset.descriptions[i].lower().strip() == desc_lower:
+            return dataset.labels[i]
+    # Fallback: keyword matching
+    for label in sorted(set(dataset.labels)):
+        if label.lower() in desc_lower:
+            return label
+    return "UNKNOWN"
 
 
 # ============================================================================
@@ -168,17 +221,26 @@ def rl_train_epoch(
     pipeline: NemesisPipeline,
     dataset: HARDataset,
     epoch: int,
-    max_samples: int = 200,
     batch_size: int = 16,
+    class_weights: Optional[Dict] = None,
+    train_fraction: float = 1.0,
 ) -> Dict:
     """
     One epoch of RL training on the dataset.
 
-    v2: Uses classification-style reward (single API call per sample),
-    entropy decay, and better logging.
+    Uses **class-balanced sampling** to prevent mode collapse:
+      - Each class gets equal representation per epoch
+      - Minority classes are oversampled, majority undersampled
+      - Class weights scale rewards (higher for rare classes)
     """
-    n = min(max_samples, len(dataset))
-    dataset_shuffled = dataset.shuffle(seed=epoch)
+    # Class-balanced sampling: equal samples per class
+    # If fraction < 1.0, reduce n_per_class proportionally
+    from collections import Counter
+    class_counts = Counter(dataset.y.tolist())
+    max_class_size = max(class_counts.values())
+    n_per_class = max(1, int(max_class_size * train_fraction))
+    balanced_indices = dataset.class_balanced_indices(n_per_class=n_per_class, seed=epoch)
+    n = len(balanced_indices)
 
     total_reward = 0.0
     num_updates = 0
@@ -186,12 +248,14 @@ def rl_train_epoch(
     rewards_list = []
     correct_count = 0
 
-    print(f"\n[RL Epoch {epoch+1}] Training on {n} samples "
+    print(f"\n[RL Epoch {epoch+1}] Training on {n} class-balanced samples "
           f"(entropy_coef={pipeline.rl_trainer.current_entropy_coef:.4f}, "
           f"lr={pipeline.rl_trainer.optimizer.param_groups[0]['lr']:.6f})...")
 
-    for i in range(n):
-        imu_data, description, label = dataset_shuffled.get_sample(i)
+    for step, idx in enumerate(balanced_indices):
+        imu_data, description, label = dataset.get_sample(idx)
+        label_int = int(dataset.y[idx])
+        cw = class_weights.get(label_int, 1.0) if class_weights else 1.0
 
         # Translate with training enabled
         result = pipeline.translate(
@@ -199,7 +263,8 @@ def rl_train_epoch(
             ground_truth=description,
             use_memory=True,
             train=True,
-            temperature=max(0.5, 1.0 - epoch * 0.1),  # decay temperature over epochs
+            temperature=max(0.5, 1.0 - epoch * 0.05),  # slow temperature decay
+            class_weight=cw,
         )
 
         total_reward += result.confidence
@@ -213,13 +278,13 @@ def rl_train_epoch(
             metrics = pipeline.rl_train_step()
             if metrics:
                 num_updates += 1
-                if num_updates % 3 == 0:
-                    print(f"  [Sample {i+1}/{n}] PPO #{num_updates}: "
+                if num_updates % max(1, (n // batch_size) // 8) == 0:
+                    print(f"  [Sample {step+1}/{n}] PPO #{num_updates}: "
                           f"loss={metrics['loss']:.4f}, "
                           f"reward={metrics['mean_reward']:.3f}, "
                           f"lr={metrics.get('lr', 0):.6f}")
 
-        # Rate limit for OpenAI API (lighter since single call now)
+        # Rate limit for OpenAI API
         time.sleep(0.08)
 
     # Final PPO update with remaining buffer
@@ -288,8 +353,8 @@ def train(args):
         sampling_rate=train_data.sampling_rate,
     )
 
-    # Estimate total PPO updates for LR schedule
-    samples_per_epoch = args.train_samples_per_epoch
+    # Estimate total PPO updates for LR schedule (use full dataset)
+    samples_per_epoch = len(train_data)
     updates_per_epoch = max(1, samples_per_epoch // args.batch_size)
     total_updates = updates_per_epoch * args.rl_epochs + 5  # +5 for warmup
 
@@ -302,8 +367,9 @@ def train(args):
         warmup_steps=5,
         classify_reward=True,  # Single API call classification
         normalize_rewards=True,
-        entropy_coef=0.05,
-        entropy_decay=0.85,
+        entropy_coef=0.08,      # Higher initial exploration
+        entropy_decay=0.95,     # Slow decay to prevent mode collapse
+        entropy_coef_min=0.02,  # Higher floor keeps some exploration always
     )
 
     # ----- Initialize pipeline -----
@@ -370,6 +436,7 @@ def train(args):
             pipeline.pretrain_tokenizer(
                 raw_imu_list,
                 num_epochs=args.vqvae_epochs,
+                patience=args.vqvae_patience,
             )
 
     # ----- Phase 1: Warm start -----
@@ -380,17 +447,33 @@ def train(args):
             samples_per_epoch=args.warmup_samples,
         )
 
-    # ----- Phase 2: RL training -----
+    # ----- Phase 2: RL training (with early stopping on macro F1) -----
     print("\n--- Phase 2: RL Training ---")
+    print(f"  Full dataset per epoch: {len(train_data)} samples")
+    print(f"  Max epochs: {args.rl_epochs}, eval every {args.eval_every}, "
+          f"patience: {args.patience}")
+
+    # Class weights for balanced reward scaling
+    class_weights = train_data.get_class_weights()
+    print(f"  Class weights (inverse frequency):")
+    for cls_int, weight in sorted(class_weights.items()):
+        # Map int label to name
+        matching = [train_data.labels[i] for i in range(len(train_data)) if train_data.y[i] == cls_int]
+        name = matching[0] if matching else f"class_{cls_int}"
+        print(f"    {name:15s}: {weight:.2f}")
+
     all_epoch_metrics = []
+    best_f1 = -1.0
+    patience_counter = 0
 
     for epoch in range(args.rl_epochs):
         epoch_metrics = rl_train_epoch(
             pipeline,
             train_data,
             epoch=epoch,
-            max_samples=args.train_samples_per_epoch,
             batch_size=args.batch_size,
+            class_weights=class_weights,
+            train_fraction=args.train_fraction,
         )
         all_epoch_metrics.append(epoch_metrics)
 
@@ -407,8 +490,29 @@ def train(args):
                 verbose=True,
             )
             all_epoch_metrics[-1]["eval"] = eval_metrics
+            current_f1 = eval_metrics["macro_f1"]
 
-    # ----- Phase 3: Final evaluation -----
+            # Early stopping check
+            if current_f1 > best_f1:
+                best_f1 = current_f1
+                patience_counter = 0
+                pipeline.rl_trainer.save_checkpoint("best")
+                print(f"  [EarlyStop] New best macro-F1: {best_f1:.3f} — saved 'best' checkpoint")
+            else:
+                patience_counter += 1
+                print(f"  [EarlyStop] No improvement ({current_f1:.3f} <= {best_f1:.3f}), "
+                      f"patience {patience_counter}/{args.patience}")
+
+            if patience_counter >= args.patience:
+                print(f"\n  *** Early stopping triggered after epoch {epoch+1} ***")
+                print(f"  *** Best macro-F1: {best_f1:.3f} ***")
+                break
+
+    # ----- Phase 3: Final evaluation (reload best if available) -----
+    best_ckpt = os.path.join(CHECKPOINTS_DIR, "translator_best.pt")
+    if os.path.isfile(best_ckpt):
+        print(f"\n--- Loading best checkpoint (macro-F1={best_f1:.3f}) ---")
+        pipeline.rl_trainer.load_checkpoint("best")
     print("\n--- Final Evaluation ---")
     final_metrics = evaluate(pipeline, test_data, max_samples=args.eval_samples)
 
@@ -454,21 +558,23 @@ def parse_args():
                         help="Warm-start epochs (syntax learning)")
     parser.add_argument("--warmup-samples", type=int, default=50,
                         help="Samples per warm-start epoch")
-    parser.add_argument("--rl-epochs", type=int, default=8,
-                        help="Number of RL training epochs")
-    parser.add_argument("--train-samples-per-epoch", type=int, default=200,
-                        help="Training samples per RL epoch")
+    parser.add_argument("--rl-epochs", type=int, default=30,
+                        help="Max RL training epochs (early stopping may end sooner)")
     parser.add_argument("--batch-size", type=int, default=16,
                         help="PPO batch size")
     parser.add_argument("--ppo-epochs", type=int, default=4,
                         help="PPO mini-epochs per update")
     parser.add_argument("--lr", type=float, default=3e-4,
                         help="Learning rate")
+    parser.add_argument("--patience", type=int, default=4,
+                        help="Early stopping patience (eval rounds without F1 improvement)")
+    parser.add_argument("--train-fraction", type=float, default=1.0,
+                        help="Fraction of dataset per RL epoch (0.1 = 10%%, class-balanced)")
 
     # Evaluation
-    parser.add_argument("--eval-samples", type=int, default=60,
-                        help="Number of test samples for evaluation")
-    parser.add_argument("--eval-every", type=int, default=2,
+    parser.add_argument("--eval-samples", type=int, default=0,
+                        help="Eval samples (0 = use entire test set)")
+    parser.add_argument("--eval-every", type=int, default=1,
                         help="Evaluate every N RL epochs")
     parser.add_argument("--eval-only", action="store_true",
                         help="Skip training, only evaluate")
@@ -486,8 +592,10 @@ def parse_args():
     # VQ-VAE tokenizer
     parser.add_argument("--use-vqvae", action="store_true",
                         help="Use VQ-VAE tokenizer instead of binning")
-    parser.add_argument("--vqvae-epochs", type=int, default=50,
-                        help="VQ-VAE pre-training epochs")
+    parser.add_argument("--vqvae-epochs", type=int, default=200,
+                        help="Max VQ-VAE pre-training epochs (early stopping included)")
+    parser.add_argument("--vqvae-patience", type=int, default=15,
+                        help="VQ-VAE early stopping patience (epochs without recon improvement)")
     parser.add_argument("--retrain-vqvae", action="store_true",
                         help="Force re-train VQ-VAE even if checkpoint exists")
 

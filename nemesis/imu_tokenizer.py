@@ -468,11 +468,12 @@ class VQVAE_Tokenizer(nn.Module):
     def train_vqvae(
         self,
         imu_data_list: List[np.ndarray],
-        num_epochs: int = 50,
+        num_epochs: int = 200,
         batch_size: int = 256,
         lr: float = 1e-3,
         device: str = "cpu",
         input_length: Optional[int] = None,
+        patience: int = 15,
         verbose: bool = True,
     ) -> Dict:
         """
@@ -555,6 +556,8 @@ class VQVAE_Tokenizer(nn.Module):
         train_recon_errors = []
         train_perplexities = []
         best_loss = float('inf')
+        best_state = None
+        patience_counter = 0
         metrics_log = []
 
         for epoch in range(num_epochs):
@@ -606,14 +609,32 @@ class VQVAE_Tokenizer(nn.Module):
                 "perplexity": float(avg_perplexity),
             })
 
-            if avg_recon < best_loss:
+            # Early stopping check
+            if avg_recon < best_loss - 1e-5:
                 best_loss = avg_recon
+                best_state = {k: v.clone() for k, v in self.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
 
-            if verbose and ((epoch + 1) % max(1, num_epochs // 10) == 0 or epoch == 0):
+            if verbose and ((epoch + 1) % max(1, num_epochs // 20) == 0 or epoch == 0):
                 print(f"  Epoch {epoch+1:3d}/{num_epochs} — "
                       f"recon_error={avg_recon:.5f}, "
                       f"perplexity={avg_perplexity:.1f}, "
-                      f"(last 100 avg recon={np.mean(train_recon_errors[-100:]):.5f})")
+                      f"best={best_loss:.5f}, "
+                      f"patience={patience_counter}/{patience}")
+
+            if patience_counter >= patience:
+                if verbose:
+                    print(f"  [VQ-VAE] Early stopping at epoch {epoch+1} "
+                          f"(no improvement for {patience} epochs)")
+                break
+
+        # Restore best weights
+        if best_state is not None:
+            self.load_state_dict(best_state)
+            if verbose:
+                print(f"[VQ-VAE] Restored best weights (recon_error={best_loss:.5f})")
 
         self._trained = True
         self.eval()

@@ -50,11 +50,16 @@ ACTIVITY_GROUPS = {
     "locomotion": {"walking", "walking_upstairs", "walking_downstairs",
                    "walking forward on a flat surface at a normal steady pace",
                    "walking up a flight of stairs at a steady pace",
-                   "walking down a flight of stairs at a steady pace"},
-    "stationary": {"sitting", "standing", "laying",
+                   "walking down a flight of stairs at a steady pace",
+                   "walk",
+                   "the person is walking around the room at a natural pace"},
+    "stationary": {"sitting", "standing", "laying", "stand", "sit", "lie",
                    "sitting still on a chair in a relaxed position",
                    "standing upright in place without moving",
-                   "lying down flat on a surface in a resting position"},
+                   "lying down flat on a surface in a resting position",
+                   "the person is standing upright without locomotion",
+                   "the person is sitting still on a chair",
+                   "the person is lying down on a deckchair"},
 }
 
 
@@ -232,19 +237,27 @@ class OpenAIRewardFunction:
                 best_opt = opt
         return best_opt
 
-    def _compute_classification_reward(self, predicted: str, ground_truth: str) -> float:
+    def _compute_classification_reward(
+        self, predicted: str, ground_truth: str, class_weight: float = 1.0,
+    ) -> float:
         """
-        Simple classification reward:
-          - Correct:  +1.0
-          - Related:  +0.3 (e.g., walking vs walking_upstairs)
-          - Wrong:    -0.1
+        Classification reward with optional class weighting.
+
+        Rewards:
+          - Correct:  +1.0 * class_weight
+          - Related:  +0.3
+          - Wrong:    -0.1 * class_weight  (penalise more for rare classes)
+
+        Args:
+            class_weight: Multiplier for this sample's class (inverse frequency).
+                          Higher for minority classes to prevent mode collapse.
         """
         pred_lower = predicted.lower().strip()
         gt_lower = ground_truth.lower().strip()
 
         # Exact or near-exact match
         if pred_lower == gt_lower or pred_lower in gt_lower or gt_lower in pred_lower:
-            return self.config.correct_reward
+            return self.config.correct_reward * class_weight
 
         # Check word overlap — if most words match, it's correct
         pred_words = set(pred_lower.split())
@@ -253,13 +266,13 @@ class OpenAIRewardFunction:
             overlap = len(pred_words & gt_words)
             union = len(pred_words | gt_words)
             if overlap / union > 0.5:
-                return self.config.correct_reward
+                return self.config.correct_reward * class_weight
 
         # Related activity (partial credit)
         if _activities_related(predicted, ground_truth):
             return self.config.partial_reward
 
-        return self.config.wrong_reward
+        return self.config.wrong_reward * class_weight
 
     def batch_compute_rewards(
         self,

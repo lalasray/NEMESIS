@@ -127,11 +127,11 @@ class RLConfig:
     # PPO clip range
     clip_epsilon: float = 0.2
     # Entropy coefficient (encourages exploration)
-    entropy_coef: float = 0.05
+    entropy_coef: float = 0.08
     # Entropy decay per epoch (multiply by this each epoch)
-    entropy_decay: float = 0.85
+    entropy_decay: float = 0.95
     # Minimum entropy coefficient
-    entropy_coef_min: float = 0.005
+    entropy_coef_min: float = 0.02
     # Value loss coefficient
     value_coef: float = 0.5
     # Max gradient norm

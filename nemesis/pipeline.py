@@ -160,9 +160,10 @@ class NemesisPipeline:
     def pretrain_tokenizer(
         self,
         imu_data_list: List[np.ndarray],
-        num_epochs: int = 50,
+        num_epochs: int = 200,
         batch_size: int = 256,
         lr: float = 1e-3,
+        patience: int = 15,
     ):
         """
         Pre-train the VQ-VAE tokenizer on raw IMU data (unsupervised).
@@ -200,6 +201,7 @@ class NemesisPipeline:
             batch_size=batch_size,
             lr=lr,
             device=self.device,
+            patience=patience,
         )
 
         # Save the VQ-VAE weights
@@ -229,6 +231,7 @@ class NemesisPipeline:
         use_memory: bool = True,
         train: bool = True,
         temperature: float = 1.0,
+        **kwargs,
     ) -> TranslationResult:
         """
         Full pipeline: IMU data → activity description.
@@ -239,6 +242,7 @@ class NemesisPipeline:
             use_memory: whether to use memory for context/caching
             train: whether to collect RL experience
             temperature: generation temperature
+            **kwargs: passed through (e.g. class_weight for reward scaling)
 
         Returns:
             TranslationResult with activity and metadata
@@ -295,11 +299,12 @@ class NemesisPipeline:
         else:
             activity = self._interpret_with_openai(symbolic_text, memory_context)
 
-        # Step 5: Compute reward
+        # Step 5: Compute reward (with optional class weighting)
         if ground_truth is not None:
+            class_weight = kwargs.get('class_weight', 1.0)
             if self.rl_config.classify_reward:
                 confidence = self.rl_trainer.reward_fn._compute_classification_reward(
-                    activity, ground_truth
+                    activity, ground_truth, class_weight=class_weight
                 )
             else:
                 confidence = self.rl_trainer.reward_fn._compute_match_reward(

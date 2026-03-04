@@ -272,6 +272,61 @@ class HARDataset:
             channels=self.channels,
         )
 
+    def class_balanced_indices(self, n_per_class: int, seed: int = 42) -> List[int]:
+        """
+        Return indices that give equal representation per class.
+
+        Oversamples minority classes and undersamples majority classes
+        so each class has exactly n_per_class samples.
+
+        Args:
+            n_per_class: samples per class. 0 = use size of largest class.
+            seed: random seed
+
+        Returns:
+            list of indices (may contain repeats for minority classes)
+        """
+        rng = np.random.RandomState(seed)
+        # Group indices by class
+        class_indices: Dict[int, List[int]] = {}
+        for i, label_int in enumerate(self.y):
+            class_indices.setdefault(int(label_int), []).append(i)
+
+        if n_per_class <= 0:
+            n_per_class = max(len(v) for v in class_indices.values())
+
+        balanced = []
+        for cls, indices in class_indices.items():
+            if len(indices) >= n_per_class:
+                # Undersample
+                balanced.extend(rng.choice(indices, size=n_per_class, replace=False).tolist())
+            else:
+                # Oversample: take all + randomly repeat
+                balanced.extend(indices)
+                extra = n_per_class - len(indices)
+                balanced.extend(rng.choice(indices, size=extra, replace=True).tolist())
+
+        rng.shuffle(balanced)
+        return balanced
+
+    def get_class_weights(self) -> Dict[int, float]:
+        """
+        Compute inverse-frequency class weights.
+
+        Returns:
+            Dict mapping integer class label → weight (higher for rare classes).
+            Weights are normalised so the mean weight = 1.0.
+        """
+        from collections import Counter
+        counts = Counter(self.y.tolist())
+        total = sum(counts.values())
+        n_classes = len(counts)
+        weights = {}
+        for cls, count in counts.items():
+            # inverse frequency, normalised
+            weights[cls] = total / (n_classes * count)
+        return weights
+
 
 # ============================================================================
 # UCI HAR Dataset Loader
