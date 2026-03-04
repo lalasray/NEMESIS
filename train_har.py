@@ -429,7 +429,8 @@ def train(args):
     # ----- Eval only mode -----
     if args.eval_only:
         print("\n--- Evaluation Only ---")
-        eval_metrics = evaluate(pipeline, test_data, max_samples=args.eval_samples)
+        eval_metrics = evaluate(pipeline, test_data, max_samples=args.eval_samples,
+                                  api_workers=args.workers)
         save_metrics({"eval": eval_metrics}, args)
         pipeline.end_session()
         return
@@ -488,6 +489,7 @@ def train(args):
             batch_size=args.batch_size,
             class_weights=class_weights,
             train_fraction=args.train_fraction,
+            api_workers=args.workers,
         )
         all_epoch_metrics.append(epoch_metrics)
 
@@ -502,6 +504,7 @@ def train(args):
                 pipeline, test_data,
                 max_samples=args.eval_samples,
                 verbose=True,
+                api_workers=args.workers,
             )
             all_epoch_metrics[-1]["eval"] = eval_metrics
             current_f1 = eval_metrics["macro_f1"]
@@ -528,7 +531,8 @@ def train(args):
         print(f"\n--- Loading best checkpoint (macro-F1={best_f1:.3f}) ---")
         pipeline.rl_trainer.load_checkpoint("best")
     print("\n--- Final Evaluation ---")
-    final_metrics = evaluate(pipeline, test_data, max_samples=args.eval_samples)
+    final_metrics = evaluate(pipeline, test_data, max_samples=args.eval_samples,
+                              api_workers=args.workers)
 
     # ----- Save results -----
     results = {
@@ -612,6 +616,10 @@ def parse_args():
                         help="VQ-VAE early stopping patience (epochs without recon improvement)")
     parser.add_argument("--retrain-vqvae", action="store_true",
                         help="Force re-train VQ-VAE even if checkpoint exists")
+
+    # Parallelism
+    parser.add_argument("--workers", type=int, default=8,
+                        help="Parallel API workers for OpenAI calls")
 
     return parser.parse_args()
 
