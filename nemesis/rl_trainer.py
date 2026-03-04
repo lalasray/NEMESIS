@@ -241,16 +241,22 @@ class OpenAIRewardFunction:
         self, predicted: str, ground_truth: str, class_weight: float = 1.0,
     ) -> float:
         """
-        Classification reward with optional class weighting.
+        Classification reward with asymmetric class weighting.
+
+        Only CORRECT predictions are scaled by class_weight (boosting rare
+        classes). Wrong predictions get a flat penalty regardless of class.
+
+        Call ``calibrate_rewards()`` before training to auto-set wrong_reward
+        so that no single-class strategy is profitable.
 
         Rewards:
-          - Correct:  +1.0 * class_weight
-          - Related:  +0.3
-          - Wrong:    -0.1 * class_weight  (penalise more for rare classes)
+          - Correct:  +correct_reward * class_weight
+          - Related:  +partial_reward  (flat)
+          - Wrong:    wrong_reward     (flat, NOT class-weighted)
 
         Args:
             class_weight: Multiplier for this sample's class (inverse frequency).
-                          Higher for minority classes to prevent mode collapse.
+                          Higher for minority classes.
         """
         pred_lower = predicted.lower().strip()
         gt_lower = ground_truth.lower().strip()
@@ -272,7 +278,8 @@ class OpenAIRewardFunction:
         if _activities_related(predicted, ground_truth):
             return self.config.partial_reward
 
-        return self.config.wrong_reward * class_weight
+        # Wrong: flat penalty (NOT scaled by class_weight)
+        return self.config.wrong_reward
 
     def batch_compute_rewards(
         self,
@@ -289,6 +296,57 @@ class OpenAIRewardFunction:
             time.sleep(0.05)  # Rate limiting (lighter since single call now)
 
         return results
+
+    def calibrate_rewards(
+        self,
+        n_classes: int,
+        class_weights: Dict[int, float],
+        margin: float = 0.1,
+    ) -> float:
+        """
+        Auto-calibrate ``wrong_reward`` so that no single-class prediction
+        strategy is profitable under class-balanced sampling.
+
+        For K classes with balanced batches, always predicting class c yields:
+
+            E[r] = (1/K) * correct_reward * w_c + ((K-1)/K) * wrong_reward
+
+        Setting wrong_reward = -correct_reward * max(w) / (K-1) makes the
+        best single-class strategy break even (E[r] = 0).  We add a small
+        margin to make it strictly negative.
+
+        This is dataset-agnostic: works for any K and any weight distribution.
+
+        Args:
+            n_classes:     Number of classes in the dataset.
+            class_weights: Dict {class_int: weight} (from dataset.get_class_weights()).
+            margin:        Extra fraction to push E[r] below zero (default 10%).
+
+        Returns:
+            The computed wrong_reward (also sets self.config.wrong_reward).
+        """
+        max_w = max(class_weights.values())
+        # wrong_reward <= -correct * max_w / (K-1)
+        wrong_reward = -self.config.correct_reward * max_w / max(n_classes - 1, 1)
+        wrong_reward *= (1.0 + margin)  # small safety margin
+        self.config.wrong_reward = round(wrong_reward, 4)
+
+        # Verify: print the worst-case expected reward
+        best_ev = max(
+            (1 / n_classes) * self.config.correct_reward * w
+            + ((n_classes - 1) / n_classes) * self.config.wrong_reward
+            for w in class_weights.values()
+        )
+        perfect_ev = sum(
+            self.config.correct_reward * w for w in class_weights.values()
+        ) / n_classes
+
+        print(f"  [RewardCalibration] K={n_classes}, max_weight={max_w:.2f}")
+        print(f"    wrong_reward = {self.config.wrong_reward:+.4f}")
+        print(f"    Worst single-class E[r] = {best_ev:+.4f}  (should be <= 0)")
+        print(f"    Perfect classifier E[r] = {perfect_ev:+.4f}  (should be >> 0)")
+
+        return self.config.wrong_reward
 
     def classify_batch_parallel(
         self,
@@ -318,6 +376,97 @@ class OpenAIRewardFunction:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(_classify_one, (i, t))
                        for i, t in enumerate(symbolic_texts)]
+            for future in as_completed(futures):
+                idx, activity = future.result()
+                activities[idx] = activity
+
+        return activities
+
+    def _classify_descriptor(self, descriptor_text: str) -> str:
+        """
+        Classify an activity from a VQ-VAE token descriptor (statistical text).
+
+        Unlike _classify_symbolic which receives neuro-symbolic language,
+        this receives a statistical description of VQ-VAE codebook tokens
+        (frequencies, transitions, entropy, etc.) and asks the LLM to
+        classify the activity from those patterns.
+        """
+        # Build sensor context section
+        if self.sensor_context:
+            ctx = self.sensor_context
+            channels_str = ", ".join(ctx.get("channel_names", []))
+            sensor_section = (
+                f"SENSOR SETUP:\n"
+                f"  Device: IMU (Inertial Measurement Unit) worn on the body\n"
+                f"  Channels: {ctx['num_channels']} ({channels_str})\n"
+                f"  Sampling rate: {ctx['sampling_rate']} Hz\n"
+                f"  Window duration: {ctx['window_duration_sec']:.2f} seconds\n\n"
+            )
+        else:
+            sensor_section = (
+                "SENSOR SETUP:\n"
+                "  Device: IMU (Inertial Measurement Unit) worn on the body\n"
+                "  Channels: 6 (accelerometer xyz + gyroscope xyz)\n\n"
+            )
+
+        options_str = "\n".join(
+            f"  {i+1}. {opt}" for i, opt in enumerate(self.activity_options)
+        )
+
+        prompt = (
+            f"{sensor_section}"
+            "A VQ-VAE neural network was trained to learn a codebook of motion primitives "
+            "from raw IMU sensor data. Each codebook entry (token) represents a distinct "
+            "learned motion pattern. Below is a statistical description of the token "
+            "sequence produced for one recording segment.\n\n"
+            "TOKEN ANALYSIS:\n"
+            f"{descriptor_text}\n\n"
+            "Each token (imu_tok_N) represents a learned motion primitive. Patterns like "
+            "high self-repetition suggest sustained/static activity, high entropy suggests "
+            "varied/dynamic movement, and burst patterns suggest rhythmic/periodic motion.\n\n"
+            "Given the above token statistics, the person was performing ONE of these activities:\n"
+            f"{options_str}\n\n"
+            "Which activity best matches? "
+            "Respond with ONLY the activity text (copy exactly from the list), nothing else."
+        )
+
+        try:
+            response = self.client.responses.create(
+                model=self.config.reward_model,
+                input=prompt,
+                temperature=0.1,
+            )
+            predicted = response.output_text.strip().lower()
+            return self._match_to_option(predicted)
+        except Exception as e:
+            print(f"[RewardFunction] OpenAI descriptor classification error: {e}")
+            return "unknown"
+
+    def classify_descriptors_parallel(
+        self,
+        descriptor_texts: List[str],
+        max_workers: int = 8,
+    ) -> List[str]:
+        """
+        Classify a batch of token descriptors in parallel using ThreadPoolExecutor.
+        Same pattern as classify_batch_parallel but uses _classify_descriptor.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        activities = [None] * len(descriptor_texts)
+
+        def _classify_one(idx_text):
+            idx, text = idx_text
+            cache_key = hash(("descriptor", text))
+            if cache_key in self._cache:
+                return idx, self._cache[cache_key][1]
+            activity = self._classify_descriptor(text)
+            self._cache[cache_key] = (0.0, activity)
+            return idx, activity
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_classify_one, (i, t))
+                       for i, t in enumerate(descriptor_texts)]
             for future in as_completed(futures):
                 idx, activity = future.result()
                 activities[idx] = activity

@@ -450,6 +450,82 @@ class NemesisPipeline:
 
         return results
 
+    def describe_and_classify_batch(
+        self,
+        imu_batch: List[np.ndarray],
+        ground_truths: Optional[List[str]] = None,
+        class_weights: Optional[List[float]] = None,
+        max_workers: int = 8,
+    ) -> List[TranslationResult]:
+        """
+        Descriptor mode: VQ-VAE tokens → statistical text → LLM classify.
+
+        Bypasses the Translator model entirely. Instead of generating
+        neuro-symbolic text, it computes statistical features of the
+        VQ-VAE token sequence and sends that directly to the LLM.
+
+        No RL training needed — this is a zero-shot approach where
+        the VQ-VAE codebook provides the learned representation and
+        the LLM does the reasoning.
+
+        Steps:
+          1. Tokenize all samples with VQ-VAE (serial, fast)
+          2. Generate statistical text descriptions (serial, fast)
+          3. Classify all with OpenAI in PARALLEL (ThreadPoolExecutor)
+          4. Compute rewards (for evaluation metrics)
+        """
+        from nemesis.token_descriptor import TokenDescriptor
+
+        B = len(imu_batch)
+        if ground_truths is None:
+            ground_truths = [None] * B
+        if class_weights is None:
+            class_weights = [1.0] * B
+
+        descriptor = TokenDescriptor(
+            codebook_size=self.imu_config.codebook_size,
+        )
+
+        # --- Step 1: Tokenize all ---
+        all_tokens = []
+        for imu_data in imu_batch:
+            tokens = self.tokenizer.tokenize(imu_data)
+            all_tokens.append(tokens)
+
+        # --- Step 2: Generate text descriptions ---
+        all_descriptions = descriptor.describe_batch(all_tokens)
+
+        # --- Step 3: Parallel LLM classification ---
+        reward_fn = self.rl_trainer.reward_fn
+        activities = reward_fn.classify_descriptors_parallel(
+            all_descriptions, max_workers=max_workers
+        )
+
+        # --- Step 4: Compute rewards ---
+        results = []
+        for i in range(B):
+            gt = ground_truths[i]
+            cw = class_weights[i]
+            activity = activities[i]
+
+            if gt is not None:
+                confidence = reward_fn._compute_classification_reward(
+                    activity, gt, class_weight=cw
+                )
+            else:
+                confidence = 0.0
+
+            results.append(TranslationResult(
+                symbolic_text=all_descriptions[i],
+                activity=activity,
+                confidence=confidence,
+                from_cache=False,
+                imu_tokens=all_tokens[i],
+                memory_context="",
+            ))
+
+        return results
+
     # ---------------------------------------------------------------
     # Training
     # ---------------------------------------------------------------

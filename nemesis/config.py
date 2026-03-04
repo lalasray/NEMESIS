@@ -160,8 +160,11 @@ class RLConfig:
     correct_reward: float = 1.0
     # Reward for partially correct (e.g. walking vs walking_upstairs)
     partial_reward: float = 0.3
-    # Reward for wrong classification
-    wrong_reward: float = -0.1
+    # Reward for wrong classification.
+    # Set to None to auto-calibrate from class weights and number of classes
+    # via reward_fn.calibrate_rewards(). Formula ensures that always predicting
+    # any single class yields E[reward] <= 0 under class-balanced sampling.
+    wrong_reward: float = -1.0
     # Running reward normalization
     normalize_rewards: bool = True
 

@@ -470,12 +470,19 @@ def train(args):
 
     # Class weights for balanced reward scaling
     class_weights = train_data.get_class_weights()
-    print(f"  Class weights (inverse frequency):")
+    print(f"  Class weights (inverse frequency, capped):")
     for cls_int, weight in sorted(class_weights.items()):
         # Map int label to name
         matching = [train_data.labels[i] for i in range(len(train_data)) if train_data.y[i] == cls_int]
         name = matching[0] if matching else f"class_{cls_int}"
         print(f"    {name:15s}: {weight:.2f}")
+
+    # Auto-calibrate wrong_reward so no single-class strategy is profitable
+    n_classes = len(set(train_data.y.tolist()))
+    pipeline.rl_trainer.reward_fn.calibrate_rewards(
+        n_classes=n_classes,
+        class_weights=class_weights,
+    )
 
     all_epoch_metrics = []
     best_f1 = -1.0

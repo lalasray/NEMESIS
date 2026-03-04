@@ -309,13 +309,18 @@ class HARDataset:
         rng.shuffle(balanced)
         return balanced
 
-    def get_class_weights(self) -> Dict[int, float]:
+    def get_class_weights(self, max_weight: float = 3.0) -> Dict[int, float]:
         """
-        Compute inverse-frequency class weights.
+        Compute inverse-frequency class weights, capped to prevent extreme ratios.
+
+        Args:
+            max_weight: Maximum allowed weight. Prevents extreme values for very
+                        rare classes (e.g. LIE with only 29 samples → 22.4×
+                        uncapped) which create perverse RL incentives.
 
         Returns:
             Dict mapping integer class label → weight (higher for rare classes).
-            Weights are normalised so the mean weight = 1.0.
+            Weights are normalised so the mean weight ≈ 1.0, then capped.
         """
         from collections import Counter
         counts = Counter(self.y.tolist())
@@ -324,7 +329,8 @@ class HARDataset:
         weights = {}
         for cls, count in counts.items():
             # inverse frequency, normalised
-            weights[cls] = total / (n_classes * count)
+            raw = total / (n_classes * count)
+            weights[cls] = min(raw, max_weight)
         return weights
 
 
