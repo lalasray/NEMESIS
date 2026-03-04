@@ -1,7 +1,27 @@
-
+# API keys
 apikey.txt
-/checkpoints
-/datasets
-/nemesis/__pycache__
-*.json
-/memory_store
+
+# Generated directories
+/checkpoints/
+/datasets/
+/results/
+/memory_store/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

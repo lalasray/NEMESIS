@@ -83,6 +83,7 @@ def evaluate(
     max_samples: int = 0,
     verbose: bool = True,
     api_workers: int = 8,
+    descriptor_mode: bool = False,
 ) -> Dict:
     """
     Evaluate the pipeline on a test set with parallel OpenAI calls.
@@ -92,6 +93,7 @@ def evaluate(
     Args:
         max_samples: 0 = use entire dataset
         api_workers: number of parallel OpenAI API threads
+        descriptor_mode: if True, use VQ-VAE token descriptors instead of Translator
     """
     reward_fn = pipeline.rl_trainer.reward_fn
 
@@ -107,7 +109,8 @@ def evaluate(
 
     eval_batch_size = max(api_workers, 16)  # process in batches
 
-    print(f"\n[Eval] Evaluating on {n} samples (workers={api_workers})...")
+    mode_label = "descriptor" if descriptor_mode else "translator"
+    print(f"\n[Eval] Evaluating on {n} samples (mode={mode_label}, workers={api_workers})...")
 
     for batch_start in range(0, n, eval_batch_size):
         batch_end = min(batch_start + eval_batch_size, n)
@@ -121,14 +124,22 @@ def evaluate(
             gt_batch.append(description)
             labels_batch.append(label)
 
-        # Batched translate with parallel API (no training, no memory)
-        batch_results = pipeline.translate_batch(
-            imu_batch,
-            ground_truths=gt_batch,
-            train=False,
-            temperature=0.3,
-            max_workers=api_workers,
-        )
+        if descriptor_mode:
+            # VQ-VAE tokens → statistical description → LLM classify
+            batch_results = pipeline.describe_and_classify_batch(
+                imu_batch,
+                ground_truths=gt_batch,
+                max_workers=api_workers,
+            )
+        else:
+            # Translator → symbolic text → LLM classify
+            batch_results = pipeline.translate_batch(
+                imu_batch,
+                ground_truths=gt_batch,
+                train=False,
+                temperature=0.3,
+                max_workers=api_workers,
+            )
 
         for j, result in enumerate(batch_results):
             label = labels_batch[j]
@@ -430,9 +441,73 @@ def train(args):
     if args.eval_only:
         print("\n--- Evaluation Only ---")
         eval_metrics = evaluate(pipeline, test_data, max_samples=args.eval_samples,
-                                  api_workers=args.workers)
+                                  api_workers=args.workers,
+                                  descriptor_mode=args.descriptor_mode)
         save_metrics({"eval": eval_metrics}, args)
         pipeline.end_session()
+        return
+
+    # ----- Descriptor mode: zero-shot (no training needed) -----
+    if args.descriptor_mode:
+        print("\n" + "=" * 60)
+        print("  DESCRIPTOR MODE — zero-shot VQ-VAE token classification")
+        print("  No Translator, no RL training.")
+        print("  VQ-VAE tokens → statistical description → LLM classify")
+        print("=" * 60)
+
+        # Need VQ-VAE
+        if args.use_vqvae:
+            vqvae_ckpt = os.path.join(CHECKPOINTS_DIR, "vqvae_pretrained.pt")
+            if os.path.isfile(vqvae_ckpt) and not args.retrain_vqvae:
+                print(f"\n--- Loading pre-trained VQ-VAE from {vqvae_ckpt} ---")
+                pipeline.tokenizer = VQVAE_Tokenizer.load_pretrained(
+                    vqvae_ckpt, device=args.device
+                )
+                print("  VQ-VAE loaded successfully.")
+            else:
+                print("\n--- Phase 0: VQ-VAE Pre-training ---")
+                raw_imu_list = [train_data.X[i] for i in range(len(train_data))]
+                pipeline.pretrain_tokenizer(
+                    raw_imu_list,
+                    num_epochs=args.vqvae_epochs,
+                    patience=args.vqvae_patience,
+                )
+
+        # Calibrate rewards for fair evaluation
+        class_weights = train_data.get_class_weights()
+        n_classes = len(set(train_data.y.tolist()))
+        pipeline.rl_trainer.reward_fn.calibrate_rewards(
+            n_classes=n_classes,
+            class_weights=class_weights,
+        )
+
+        # Show a sample description for the first test sample
+        print("\n--- Sample Token Description ---")
+        sample_imu, sample_desc, sample_label = test_data.get_sample(0)
+        sample_tokens = pipeline.tokenizer.tokenize(sample_imu)
+        from nemesis.token_descriptor import TokenDescriptor
+        desc = TokenDescriptor(codebook_size=imu_config.codebook_size)
+        print(desc.describe(sample_tokens))
+        print(f"\n(Ground truth: {sample_label} — {sample_desc})")
+
+        # Evaluate
+        print("\n--- Descriptor Mode Evaluation ---")
+        eval_metrics = evaluate(
+            pipeline, test_data,
+            max_samples=args.eval_samples,
+            verbose=True,
+            api_workers=args.workers,
+            descriptor_mode=True,
+        )
+
+        results = {
+            "args": vars(args),
+            "mode": "descriptor",
+            "eval": eval_metrics,
+        }
+        save_metrics(results, args)
+        pipeline.end_session()
+        print("\nDescriptor mode evaluation complete!")
         return
 
     # ----- Phase 0: VQ-VAE pre-training (if enabled) -----
@@ -623,6 +698,12 @@ def parse_args():
                         help="VQ-VAE early stopping patience (epochs without recon improvement)")
     parser.add_argument("--retrain-vqvae", action="store_true",
                         help="Force re-train VQ-VAE even if checkpoint exists")
+
+    # Descriptor mode (bypass Translator entirely)
+    parser.add_argument("--descriptor-mode", action="store_true",
+                        help="Use VQ-VAE token descriptors instead of Translator. "
+                             "Zero-shot: VQ-VAE tokens → statistical text → LLM classify. "
+                             "No RL training needed.")
 
     # Parallelism
     parser.add_argument("--workers", type=int, default=8,
