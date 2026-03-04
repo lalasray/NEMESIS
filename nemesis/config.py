@@ -49,6 +49,9 @@ class IMUTokenizerConfig:
     sampling_rate: int = 50
 
 
+MEMORY_DIR = os.path.join(PROJECT_ROOT, "memory_store")
+
+
 # ---------------------------------------------------------------------------
 # OpenAI Classifier
 # ---------------------------------------------------------------------------
@@ -62,3 +65,20 @@ class ClassifierConfig:
     partial_reward: float = 0.3
     # Reward for wrong classification (auto-calibrated before eval)
     wrong_reward: float = -1.0
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical Memory
+# ---------------------------------------------------------------------------
+@dataclass
+class MemoryConfig:
+    # SQLite database path
+    db_path: str = os.path.join(MEMORY_DIR, "memory.db")
+    # VQ-VAE codebook size (must match IMUTokenizerConfig)
+    codebook_size: int = 1028
+    # Number of few-shot neighbours to retrieve
+    top_k: int = 5
+    # Minimum confidence to store an inference in short-term memory
+    store_threshold: float = 0.6
+    # Minimum confidence + neighbour agreement to promote to long-term
+    promote_threshold: float = 0.85

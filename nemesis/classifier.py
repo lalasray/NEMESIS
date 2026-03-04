@@ -143,6 +143,15 @@ class OpenAIClassifier:
 
         return activities
 
+    def set_few_shot_examples(self, examples: List[Dict]):
+        """Set the few-shot examples for the current query.
+
+        Args:
+            examples: List of dicts with keys:
+              activity, similarity, top_tokens, confidence
+        """
+        self._few_shot_examples = examples
+
     def _call_llm(self, descriptor_text: str) -> str:
         """Send a token descriptor to the LLM for classification."""
         # Build sensor context section
@@ -167,18 +176,34 @@ class OpenAIClassifier:
             f"  {i+1}. {opt}" for i, opt in enumerate(self.activity_options)
         )
 
+        # Build few-shot section from memory
+        few_shot_section = ""
+        examples = getattr(self, "_few_shot_examples", None)
+        if examples:
+            lines = ["REFERENCE EXAMPLES (from memory — similar token patterns seen before):"]
+            for i, ex in enumerate(examples, 1):
+                sim_pct = ex['similarity'] * 100
+                src = "ground truth" if ex.get('confidence', 0) >= 1.0 else "past inference"
+                lines.append(
+                    f"  Example {i} (similarity={sim_pct:.0f}%, {src}): "
+                    f"Activity = {ex['activity']}  |  Top tokens: {ex.get('top_tokens', '?')}"
+                )
+            lines.append("")
+            few_shot_section = "\n".join(lines) + "\n"
+
         prompt = (
             f"{sensor_section}"
             "A VQ-VAE neural network was trained to learn a codebook of motion primitives "
             "from raw IMU sensor data. Each codebook entry (token) represents a distinct "
             "learned motion pattern. Below is a statistical description of the token "
             "sequence produced for one recording segment.\n\n"
-            "TOKEN ANALYSIS:\n"
+            f"{few_shot_section}"
+            "TOKEN ANALYSIS (current sample):\n"
             f"{descriptor_text}\n\n"
-            "Each token (imu_tok_N) represents a learned motion primitive. Patterns like "
-            "high self-repetition suggest sustained/static activity, high entropy suggests "
-            "varied/dynamic movement, and burst patterns suggest rhythmic/periodic motion.\n\n"
-            "Given the above token statistics, the person was performing ONE of these activities:\n"
+            "Each token (imu_tok_N) represents a learned motion primitive. The REFERENCE "
+            "EXAMPLES above show what activities were associated with similar token "
+            "patterns in the past. Use them to ground your classification.\n\n"
+            "Given the above, the person was performing ONE of these activities:\n"
             f"{options_str}\n\n"
             "Which activity best matches? "
             "Respond with ONLY the activity text (copy exactly from the list), nothing else."

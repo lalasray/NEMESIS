@@ -26,7 +26,10 @@ import numpy as np
 from typing import Dict, List, Optional
 from collections import defaultdict
 
-from nemesis.config import IMUTokenizerConfig, ClassifierConfig, CHECKPOINTS_DIR, PROJECT_ROOT
+from nemesis.config import (
+    IMUTokenizerConfig, ClassifierConfig, MemoryConfig,
+    CHECKPOINTS_DIR, PROJECT_ROOT, MEMORY_DIR,
+)
 from nemesis.datasets import (
     load_uci_har, load_opportunity, print_dataset_info, HARDataset,
 )
@@ -197,8 +200,8 @@ def run(args):
     """Main training + evaluation flow."""
 
     print("\n" + "=" * 60)
-    print("  NEMESIS — Descriptor Mode")
-    print("  VQ-VAE tokens → statistical text → LLM classify")
+    print("  NEMESIS — Few-Shot Memory Mode")
+    print("  VQ-VAE tokens → memory query → few-shot LLM classify")
     print("=" * 60)
 
     # ----- Load dataset -----
@@ -230,10 +233,19 @@ def run(args):
         partial_reward=0.3,
     )
 
+    memory_config = MemoryConfig(
+        db_path=os.path.join(MEMORY_DIR, f"{args.dataset}_memory.db"),
+        codebook_size=imu_config.codebook_size,
+        top_k=args.top_k,
+        store_threshold=0.6,
+        promote_threshold=0.85,
+    )
+
     # ----- Initialise pipeline -----
     pipeline = NemesisPipeline(
         imu_config=imu_config,
         classifier_config=classifier_config,
+        memory_config=memory_config,
         device=args.device,
     )
 
@@ -250,11 +262,20 @@ def run(args):
         window_samples = train_data.X.shape[1]
         window_duration = window_samples / train_data.sampling_rate
 
+    # Determine IMU position from dataset
+    imu_position = ""
+    if args.dataset == "opportunity":
+        imu_position = "BACK"
+    elif args.dataset == "uci_har":
+        imu_position = "WAIST"
+
     pipeline.set_sensor_context(
         num_channels=num_channels,
         channel_names=channel_names,
         sampling_rate=train_data.sampling_rate,
         window_duration_sec=window_duration,
+        dataset=args.dataset,
+        imu_position=imu_position,
     )
 
     # ----- VQ-VAE pre-training -----
@@ -282,6 +303,25 @@ def run(args):
         class_weights=class_weights,
     )
 
+    # ----- Bootstrap memory -----
+    if args.clear_memory:
+        print("\n--- Clearing memory ---")
+        pipeline.memory.clear()
+
+    if pipeline.memory.count() == 0:
+        print("\n--- Bootstrapping memory from training data ---")
+        print(f"  Tokenizing {len(train_data)} training samples...")
+        tokens_list = []
+        train_labels = []
+        for i in range(len(train_data)):
+            imu_data, desc, label = train_data.get_sample(i)
+            tokens = pipeline.tokenizer.tokenize(imu_data)
+            tokens_list.append(tokens)
+            train_labels.append(desc)  # use description (full activity name)
+        pipeline.bootstrap_memory(tokens_list, train_labels)
+    else:
+        print(f"\n--- Memory already populated: {pipeline.memory.count()} entries ---")
+
     # ----- Show sample description -----
     print("\n--- Sample Token Description ---")
     sample_imu, sample_desc, sample_label = test_data.get_sample(0)
@@ -298,11 +338,16 @@ def run(args):
         api_workers=args.workers,
     )
 
+    # ----- Promote and show memory stats -----
+    pipeline.memory.promote_short_term()
+    pipeline.memory._print_stats()
+
     # ----- Save results -----
     results = {
         "args": vars(args),
-        "mode": "descriptor",
+        "mode": "few_shot_memory",
         "eval": eval_metrics,
+        "memory_entries": pipeline.memory.count(),
     }
     save_results(results, args)
     print("\nDone!")
@@ -324,7 +369,7 @@ def save_results(results: Dict, args):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="NEMESIS — VQ-VAE descriptor mode for HAR"
+        description="NEMESIS — Few-shot memory mode for HAR"
     )
 
     # Dataset
@@ -349,6 +394,12 @@ def parse_args():
                         help="VQ-VAE early stopping patience")
     parser.add_argument("--retrain-vqvae", action="store_true",
                         help="Force re-train VQ-VAE even if checkpoint exists")
+
+    # Memory
+    parser.add_argument("--top-k", type=int, default=5,
+                        help="Number of few-shot neighbours to retrieve")
+    parser.add_argument("--clear-memory", action="store_true",
+                        help="Clear memory DB before bootstrapping")
 
     # Parallelism
     parser.add_argument("--workers", type=int, default=8,

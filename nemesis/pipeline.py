@@ -1,15 +1,15 @@
 """
-NEMESIS Pipeline — VQ-VAE token description → LLM activity classification.
+NEMESIS Pipeline — VQ-VAE token description + few-shot memory → LLM classification.
 
-    IMU stream ──► VQ-VAE Tokenizer ──► Token Statistics ──► LLM ──► Activity
-                    (424K params)        (frequencies,
-                                          entropy,
-                                          transitions,
-                                          bursts, ...)
+    IMU stream ──► VQ-VAE ──► Token Stats ──► Memory Query ──► LLM ──► Activity
+                 (424K)     (frequencies,    (K nearest      (few-shot
+                             entropy,         histograms)     grounded)
+                             transitions)
 
 The VQ-VAE learns a codebook of motion primitives (unsupervised).
-Token sequences are described statistically and classified by an LLM
-in a zero-shot manner — no Transformer or RL training needed.
+At inference the K most similar past examples (by token histogram
+cosine similarity) are retrieved from hierarchical memory and
+injected as few-shot context, grounding the opaque token IDs.
 """
 
 import os
@@ -18,11 +18,13 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
 from nemesis.config import (
-    IMUTokenizerConfig, ClassifierConfig, load_api_key, CHECKPOINTS_DIR,
+    IMUTokenizerConfig, ClassifierConfig, MemoryConfig,
+    load_api_key, CHECKPOINTS_DIR,
 )
 from nemesis.imu_tokenizer import VQVAE_Tokenizer
 from nemesis.token_descriptor import TokenDescriptor
 from nemesis.classifier import OpenAIClassifier
+from nemesis.memory import MemoryStore
 
 
 # ============================================================================
@@ -52,22 +54,33 @@ class NemesisPipeline:
         self,
         imu_config: IMUTokenizerConfig = IMUTokenizerConfig(),
         classifier_config: ClassifierConfig = ClassifierConfig(),
+        memory_config: MemoryConfig = MemoryConfig(),
         device: str = "cpu",
     ):
         self.device = device
         self.imu_config = imu_config
         self.classifier_config = classifier_config
+        self.memory_config = memory_config
 
         # --- Components ---
         self.tokenizer = VQVAE_Tokenizer(imu_config)
         self.descriptor = TokenDescriptor(codebook_size=imu_config.codebook_size)
         self.classifier = OpenAIClassifier(classifier_config)
+        self.memory = MemoryStore(memory_config)
 
-        print(f"[NEMESIS] Pipeline initialised (descriptor mode)")
+        # Metadata for memory queries (set via set_sensor_context)
+        self._dataset: str = ""
+        self._imu_position: str = ""
+        self._sampling_rate: int = 0
+        self._num_channels: int = 0
+        self._session_id: str = f"session_{int(__import__('time').time())}"
+
+        print(f"[NEMESIS] Pipeline initialised (few-shot memory mode)")
         trained = self.tokenizer.is_trained
         status = "trained" if trained else "NEEDS PRE-TRAINING"
         print(f"  VQ-VAE Tokenizer: {status}")
         print(f"  Codebook: {imu_config.codebook_size} entries, {imu_config.vq_embedding_dim}-dim")
+        print(f"  Memory: {self.memory.count()} entries")
         print(f"  Device: {device}")
 
     # ------------------------------------------------------------------
@@ -85,8 +98,10 @@ class NemesisPipeline:
         channel_names: List[str] = None,
         sampling_rate: int = 50,
         window_duration_sec: float = 2.56,
+        dataset: str = "",
+        imu_position: str = "",
     ):
-        """Set IMU sensor context included in LLM prompts."""
+        """Set IMU sensor context included in LLM prompts + memory queries."""
         if channel_names is None:
             channel_names = [f"ch_{i}" for i in range(num_channels)]
         ctx = {
@@ -96,8 +111,14 @@ class NemesisPipeline:
             "window_duration_sec": window_duration_sec,
         }
         self.classifier.set_sensor_context(ctx)
+        self._dataset = dataset
+        self._imu_position = imu_position
+        self._sampling_rate = sampling_rate
+        self._num_channels = num_channels
         print(f"[NEMESIS] Sensor context: {num_channels}ch @ {sampling_rate}Hz, "
               f"{window_duration_sec:.2f}s windows")
+        if dataset:
+            print(f"  Dataset: {dataset}, IMU position: {imu_position}")
 
     # ------------------------------------------------------------------
     # VQ-VAE pre-training
@@ -146,27 +167,46 @@ class NemesisPipeline:
     # Classification
     # ------------------------------------------------------------------
 
+    def bootstrap_memory(
+        self,
+        tokens_list: List[List[int]],
+        labels: List[str],
+    ):
+        """Populate long-term memory from labeled training data."""
+        self.memory.bootstrap(
+            tokens_list=tokens_list,
+            labels=labels,
+            dataset=self._dataset,
+            imu_position=self._imu_position,
+            sampling_rate=self._sampling_rate,
+            num_channels=self._num_channels,
+            session_id=self._session_id,
+        )
+
     def classify_batch(
         self,
         imu_batch: List[np.ndarray],
         ground_truths: Optional[List[str]] = None,
         class_weights: Optional[List[float]] = None,
         max_workers: int = 8,
+        store_inferences: bool = False,
     ) -> List[ClassificationResult]:
         """
-        Classify a batch of IMU segments.
+        Classify a batch of IMU segments with few-shot memory retrieval.
 
         Steps:
           1. Tokenize all samples with VQ-VAE (serial, fast)
           2. Generate statistical text descriptions (serial, fast)
-          3. Classify all with OpenAI in PARALLEL (ThreadPoolExecutor)
-          4. Compute rewards (for evaluation metrics)
+          3. Query memory for K nearest examples per sample
+          4. Classify all with OpenAI in PARALLEL (few-shot grounded)
+          5. Compute rewards and optionally store inferences
 
         Args:
             imu_batch: List of (T, C) raw IMU arrays
             ground_truths: Optional activity labels for scoring
             class_weights: Optional per-sample class weights
             max_workers: Parallel API threads
+            store_inferences: If True, store high-confidence results in memory
 
         Returns:
             List of ClassificationResult
@@ -186,12 +226,42 @@ class NemesisPipeline:
         # Step 2: Describe
         all_descriptions = self.descriptor.describe_batch(all_tokens)
 
-        # Step 3: Parallel LLM classification
-        activities = self.classifier.classify_batch(
-            all_descriptions, max_workers=max_workers
-        )
+        # Step 3: Query memory for few-shot neighbours per sample
+        all_neighbours = []
+        for tokens in all_tokens:
+            neighbours = self.memory.query(
+                tokens=tokens,
+                dataset=self._dataset,
+                imu_position=self._imu_position,
+                sampling_rate=self._sampling_rate,
+            )
+            all_neighbours.append(neighbours)
 
-        # Step 4: Compute rewards
+        # Step 4: Parallel LLM classification with per-sample few-shot
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        activities = [None] * B
+
+        def _classify_one(idx):
+            desc = all_descriptions[idx]
+            neighbours = all_neighbours[idx]
+            # Set per-sample few-shot examples (thread-local via direct call)
+            cache_key = hash(("fewshot", desc, str(neighbours)))
+            if cache_key in self.classifier._cache:
+                return idx, self.classifier._cache[cache_key]
+            # Build per-sample prompt by temporarily injecting examples
+            self.classifier.set_few_shot_examples(neighbours)
+            activity = self.classifier._call_llm(desc)
+            self.classifier._cache[cache_key] = activity
+            return idx, activity
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_classify_one, i) for i in range(B)]
+            for future in as_completed(futures):
+                idx, activity = future.result()
+                activities[idx] = activity
+
+        # Step 5: Compute rewards + optionally store
         results = []
         for i in range(B):
             gt = ground_truths[i]
@@ -202,6 +272,20 @@ class NemesisPipeline:
                 reward = self.classifier.compute_reward(activity, gt, class_weight=cw)
             else:
                 reward = 0.0
+
+            # Store high-confidence inferences in memory
+            if store_inferences:
+                self.memory.store_inference(
+                    tokens=all_tokens[i],
+                    predicted_activity=activity,
+                    confidence=max(0.0, reward),
+                    dataset=self._dataset,
+                    imu_position=self._imu_position,
+                    sampling_rate=self._sampling_rate,
+                    num_channels=self._num_channels,
+                    session_id=self._session_id,
+                    neighbours=all_neighbours[i],
+                )
 
             results.append(ClassificationResult(
                 descriptor_text=all_descriptions[i],
