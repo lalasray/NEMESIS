@@ -373,20 +373,22 @@ class MemoryStore:
         long_term_only: bool = False,
     ) -> List[Dict]:
         """
-        Find the K most similar stored examples by cosine similarity on
-        the token histogram, filtered to matching metadata.
+        Diverse retrieval: find the top `num_diverse_activities` unique
+        activities (by best similarity), then return `top_k_per_activity`
+        entries from each.
 
-        Args:
-            tokens: VQ-VAE token IDs for the query sample.
-            top_k: Number of results. 0 = use config default.
-            long_term_only: If True, only return long-term entries.
+        This ensures the LLM sees multiple activity hypotheses with
+        strong supporting evidence for each, not just 5 entries that
+        might all be the same class.
 
         Returns:
-            List of dicts, each with keys:
-              activity, similarity, confidence, tier, top_tokens
+            List of dicts grouped by activity (top activities first,
+            entries within each group sorted by similarity).
+            Total entries = num_diverse_activities × top_k_per_activity
+            (or fewer if not enough data).
         """
-        if top_k <= 0:
-            top_k = self.config.top_k
+        k_per_act = self.config.top_k_per_activity   # 5
+        n_acts = self.config.num_diverse_activities    # 3
 
         self._build_index(dataset, imu_position, sampling_rate)
 
@@ -415,24 +417,41 @@ class MemoryStore:
         else:
             sims = raw_sims
 
-        # Top K
-        k = min(top_k, len(sims))
-        top_indices = np.argpartition(sims, -k)[-k:]
-        top_indices = top_indices[np.argsort(sims[top_indices])[::-1]]
+        # Sort ALL indices by descending similarity
+        sorted_indices = np.argsort(sims)[::-1]
 
-        results = []
-        for idx in top_indices:
+        # Group by activity: find top n_acts unique activities in rank order,
+        # collecting up to k_per_act entries for each.
+        from collections import OrderedDict
+        activity_groups: OrderedDict = OrderedDict()  # activity -> list of idx
+
+        for idx in sorted_indices:
             if sims[idx] < 0:
                 continue
-            results.append({
-                "activity": self._index_labels[idx],
-                "similarity": float(sims[idx]),
-                "raw_similarity": float(raw_sims[idx]),
-                "confidence": self._index_confidences[idx],
-                "tier": self._index_tiers[idx],
-                "top_tokens": self._index_descriptors[idx],
-                "entry_id": self._index_ids[idx],
-            })
+            act = self._index_labels[idx]
+            if act not in activity_groups:
+                if len(activity_groups) >= n_acts:
+                    # Already have enough unique activities;
+                    # only add if this activity is already tracked
+                    continue
+                activity_groups[act] = []
+            if len(activity_groups[act]) < k_per_act:
+                activity_groups[act].append(idx)
+
+        # Flatten into results: activities in discovery order (best first),
+        # entries within each activity by similarity.
+        results = []
+        for act, indices in activity_groups.items():
+            for idx in indices:
+                results.append({
+                    "activity": self._index_labels[idx],
+                    "similarity": float(sims[idx]),
+                    "raw_similarity": float(raw_sims[idx]),
+                    "confidence": self._index_confidences[idx],
+                    "tier": self._index_tiers[idx],
+                    "top_tokens": self._index_descriptors[idx],
+                    "entry_id": self._index_ids[idx],
+                })
         return results
 
     # -----------------------------------------------------------------

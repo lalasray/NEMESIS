@@ -76,8 +76,12 @@ class MemoryConfig:
     db_path: str = os.path.join(MEMORY_DIR, "memory.db")
     # VQ-VAE codebook size (must match IMUTokenizerConfig)
     codebook_size: int = 1028
-    # Number of few-shot neighbours to retrieve
+    # Number of few-shot neighbours to retrieve (legacy, used as fallback)
     top_k: int = 5
+    # Number of entries per unique activity in diverse retrieval
+    top_k_per_activity: int = 5
+    # Number of top unique activities to retrieve from
+    num_diverse_activities: int = 3
     # Minimum confidence to store an inference in short-term memory
     store_threshold: float = 0.6
     # Minimum confidence + neighbour agreement to promote to long-term

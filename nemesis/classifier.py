@@ -176,19 +176,39 @@ class OpenAIClassifier:
             f"  {i+1}. {opt}" for i, opt in enumerate(self.activity_options)
         )
 
-        # Build few-shot section from memory
+        # Build few-shot section from memory (grouped by activity)
         few_shot_section = ""
         examples = getattr(self, "_few_shot_examples", None)
         if examples:
-            lines = ["REFERENCE EXAMPLES (from memory — similar token patterns seen before):"]
-            for i, ex in enumerate(examples, 1):
-                sim_pct = ex['similarity'] * 100
-                src = "ground truth" if ex.get('confidence', 0) >= 1.0 else "past inference"
+            # Group examples by activity, preserving order (top activity first)
+            from collections import OrderedDict
+            grouped: OrderedDict = OrderedDict()
+            for ex in examples:
+                act = ex["activity"]
+                if act not in grouped:
+                    grouped[act] = []
+                grouped[act].append(ex)
+
+            lines = [
+                "REFERENCE EXAMPLES (from memory — similar token patterns seen before):",
+                f"  Retrieved {len(examples)} examples across {len(grouped)} candidate activities.\n",
+            ]
+            for act_idx, (act, act_examples) in enumerate(grouped.items(), 1):
+                avg_sim = sum(e['similarity'] for e in act_examples) / len(act_examples)
+                best_sim = max(e['similarity'] for e in act_examples)
                 lines.append(
-                    f"  Example {i} (similarity={sim_pct:.0f}%, {src}): "
-                    f"Activity = {ex['activity']}  |  Top tokens: {ex.get('top_tokens', '?')}"
+                    f"  Candidate Activity {act_idx}: \"{act}\" "
+                    f"({len(act_examples)} matches, best_sim={best_sim*100:.0f}%, "
+                    f"avg_sim={avg_sim*100:.0f}%)"
                 )
-            lines.append("")
+                for j, ex in enumerate(act_examples, 1):
+                    sim_pct = ex['similarity'] * 100
+                    src = "ground truth" if ex.get('confidence', 0) >= 1.0 else "past inference"
+                    lines.append(
+                        f"    Entry {j} (sim={sim_pct:.0f}%, {src}): "
+                        f"Top tokens: {ex.get('top_tokens', '?')}"
+                    )
+                lines.append("")
             few_shot_section = "\n".join(lines) + "\n"
 
         prompt = (

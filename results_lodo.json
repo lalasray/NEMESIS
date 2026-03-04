@@ -1,0 +1,136 @@
+{
+  "datasets_loaded": [
+    "opportunity",
+    "uci_har",
+    "pamap2",
+    "mhealth",
+    "daphnet",
+    "dsa",
+    "hapt"
+  ],
+  "datasets_failed": [],
+  "mode": "lodo",
+  "target_rate": 30,
+  "elapsed_seconds": 123.03120589256287,
+  "results": [
+    {
+      "tag": "LODO held=daphnet",
+      "accuracy": 0.81,
+      "macro_f1": 0.44751381215469616,
+      "n_samples": 200,
+      "n_classes_gt": 2,
+      "n_classes_pred": 2,
+      "held_out": "daphnet",
+      "train_datasets": [
+        "dsa",
+        "hapt",
+        "mhealth",
+        "opportunity",
+        "pamap2",
+        "uci_har"
+      ]
+    },
+    {
+      "tag": "LODO held=dsa",
+      "accuracy": 0.03,
+      "macro_f1": 0.00545728830469459,
+      "n_samples": 200,
+      "n_classes_gt": 19,
+      "n_classes_pred": 7,
+      "held_out": "dsa",
+      "train_datasets": [
+        "daphnet",
+        "hapt",
+        "mhealth",
+        "opportunity",
+        "pamap2",
+        "uci_har"
+      ]
+    },
+    {
+      "tag": "LODO held=hapt",
+      "accuracy": 0.215,
+      "macro_f1": 0.039323273891175126,
+      "n_samples": 200,
+      "n_classes_gt": 9,
+      "n_classes_pred": 1,
+      "held_out": "hapt",
+      "train_datasets": [
+        "daphnet",
+        "dsa",
+        "mhealth",
+        "opportunity",
+        "pamap2",
+        "uci_har"
+      ]
+    },
+    {
+      "tag": "LODO held=mhealth",
+      "accuracy": 0.13,
+      "macro_f1": 0.04037121294189868,
+      "n_samples": 200,
+      "n_classes_gt": 12,
+      "n_classes_pred": 4,
+      "held_out": "mhealth",
+      "train_datasets": [
+        "daphnet",
+        "dsa",
+        "hapt",
+        "opportunity",
+        "pamap2",
+        "uci_har"
+      ]
+    },
+    {
+      "tag": "LODO held=opportunity",
+      "accuracy": 0.35,
+      "macro_f1": 0.20904656974713137,
+      "n_samples": 200,
+      "n_classes_gt": 4,
+      "n_classes_pred": 3,
+      "held_out": "opportunity",
+      "train_datasets": [
+        "daphnet",
+        "dsa",
+        "hapt",
+        "mhealth",
+        "pamap2",
+        "uci_har"
+      ]
+    },
+    {
+      "tag": "LODO held=pamap2",
+      "accuracy": 0.015,
+      "macro_f1": 0.018996960486322188,
+      "n_samples": 200,
+      "n_classes_gt": 12,
+      "n_classes_pred": 6,
+      "held_out": "pamap2",
+      "train_datasets": [
+        "daphnet",
+        "dsa",
+        "hapt",
+        "mhealth",
+        "opportunity",
+        "uci_har"
+      ]
+    },
+    {
+      "tag": "LODO held=uci_har",
+      "accuracy": 0.215,
+      "macro_f1": 0.06099290780141844,
+      "n_samples": 200,
+      "n_classes_gt": 6,
+      "n_classes_pred": 2,
+      "held_out": "uci_har",
+      "train_datasets": [
+        "daphnet",
+        "dsa",
+        "hapt",
+        "mhealth",
+        "opportunity",
+        "pamap2"
+      ]
+    }
+  ]
+}

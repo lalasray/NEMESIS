@@ -244,8 +244,11 @@ def run_standard(args, datasets: dict) -> list:
         device="cuda" if args.gpu else "cpu",
     )
 
-    ckpt_tag = "_".join(sorted(datasets.keys()))
-    ckpt_path = os.path.join(CHECKPOINTS_DIR, f"vqvae_{ckpt_tag}_{target_rate}Hz.pt")
+    if args.vqvae_ckpt:
+        ckpt_path = args.vqvae_ckpt
+    else:
+        ckpt_tag = "_".join(sorted(datasets.keys()))
+        ckpt_path = os.path.join(CHECKPOINTS_DIR, f"vqvae_{ckpt_tag}_{target_rate}Hz.pt")
 
     if os.path.exists(ckpt_path) and not args.retrain:
         print(f"\n[VQ-VAE] Loading checkpoint: {ckpt_path}")
@@ -392,8 +395,11 @@ def run_lodo(args, datasets: dict) -> list:
         )
 
         # VQ-VAE
-        ckpt_tag = "lodo_" + "_".join(train_names)
-        ckpt_path = os.path.join(CHECKPOINTS_DIR, f"vqvae_{ckpt_tag}_{target_rate}Hz.pt")
+        if args.vqvae_ckpt:
+            ckpt_path = args.vqvae_ckpt
+        else:
+            ckpt_tag = "lodo_" + "_".join(train_names)
+            ckpt_path = os.path.join(CHECKPOINTS_DIR, f"vqvae_{ckpt_tag}_{target_rate}Hz.pt")
 
         if os.path.exists(ckpt_path) and not args.retrain:
             pipeline.tokenizer.load_pretrained(ckpt_path)
@@ -551,6 +557,10 @@ def main():
         help="Force VQ-VAE retraining even if checkpoint exists",
     )
     parser.add_argument(
+        "--vqvae-ckpt", type=str, default="",
+        help="Path to a pre-trained VQ-VAE checkpoint (skips training entirely)",
+    )
+    parser.add_argument(
         "--gpu", action="store_true",
         help="Use CUDA GPU",
     )
@@ -572,6 +582,7 @@ def main():
     print(f"  LODO:         {args.lodo}")
     print(f"  Target rate:  {args.target_rate} Hz")
     print(f"  VQ-VAE epochs:{args.vqvae_epochs}")
+    print(f"  VQ-VAE ckpt:  {args.vqvae_ckpt or 'auto'}")
     print(f"  Learn epochs: {args.learn_epochs} (patience={args.learn_patience})")
     print(f"  Max eval:     {args.max_eval_samples} per dataset")
     print(f"  Output:       {args.output}")
