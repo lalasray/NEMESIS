@@ -7,7 +7,7 @@ Translates IMU sensor data into neuro-symbolic representations, interprets them 
 ## Architecture
 
 ```
-IMU Stream ──► [Tokenizer] ──► [Translator] ──► Neuro-Symbolic ──► [OpenAI] ──► Activity
+IMU Stream ──► [Tokenizer] ──► [Translator] ──► Neuro-Symbolic ──► OpenAI API ──► Activity
                                      ▲                                  │
                                      └──── RL Reward ──────────────────┘
                                                                         │
